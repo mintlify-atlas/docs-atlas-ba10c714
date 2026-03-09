@@ -1,122 +1,133 @@
 {
   "$schema": "https://mintlify.com/docs.json",
-  "theme": "mint",
-  "name": "Mint Starter Kit",
+  "name": "Snuba",
+  "theme": "aspen",
   "colors": {
-    "primary": "#16A34A",
-    "light": "#07C983",
-    "dark": "#15803D"
+    "primary": "#5B4FE5",
+    "light": "#7D72FF",
+    "dark": "#3E35B5"
   },
-  "favicon": "/favicon.svg",
+  "navbar": {
+    "primary": {
+      "type": "github",
+      "href": "https://github.com/getsentry/snuba"
+    }
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/getsentry/snuba"
+    }
+  },
   "navigation": {
     "tabs": [
       {
-        "tab": "Guides",
+        "tab": "Documentation",
         "groups": [
           {
-            "group": "Getting started",
+            "group": "Get Started",
             "pages": [
-              "index",
+              "introduction",
               "quickstart",
-              "development"
+              "installation"
             ]
           },
           {
-            "group": "Customization",
+            "group": "Architecture",
             "pages": [
-              "essentials/settings",
-              "essentials/navigation"
+              "architecture/overview",
+              "architecture/data-model",
+              "architecture/storage",
+              "architecture/ingestion",
+              "architecture/query-processing",
+              "architecture/slicing"
             ]
           },
           {
-            "group": "Writing content",
+            "group": "Query Languages",
             "pages": [
-              "essentials/markdown",
-              "essentials/code",
-              "essentials/images",
-              "essentials/reusable-snippets"
+              "query/overview",
+              "query/snql",
+              "query/mql",
+              "query/optimization"
             ]
           },
           {
-            "group": "AI tools",
+            "group": "Datasets",
             "pages": [
-              "ai-tools/cursor",
-              "ai-tools/claude-code",
-              "ai-tools/windsurf"
+              "datasets/overview",
+              "datasets/events",
+              "datasets/transactions",
+              "datasets/metrics",
+              "datasets/sessions",
+              "datasets/replays"
+            ]
+          },
+          {
+            "group": "Configuration",
+            "pages": [
+              "configuration/overview",
+              "configuration/datasets",
+              "configuration/entities",
+              "configuration/storages",
+              "configuration/subscriptions"
+            ]
+          },
+          {
+            "group": "Migrations",
+            "pages": [
+              "migrations/overview",
+              "migrations/modes",
+              "migrations/creating-migrations",
+              "migrations/distributed"
+            ]
+          },
+          {
+            "group": "Operations",
+            "pages": [
+              "operations/deployment",
+              "operations/monitoring",
+              "operations/scaling",
+              "operations/clickhouse-topology"
             ]
           }
         ]
       },
       {
-        "tab": "API reference",
+        "tab": "CLI Reference",
         "groups": [
           {
-            "group": "API documentation",
+            "group": "Commands",
             "pages": [
-              "api-reference/introduction"
+              "cli/overview",
+              "cli/consumer",
+              "cli/migrations",
+              "cli/devserver",
+              "cli/admin"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Endpoints",
+            "pages": [
+              "api/overview",
+              "api/query",
+              "api/subscriptions"
             ]
           },
           {
-            "group": "Endpoint examples",
+            "group": "Python API",
             "pages": [
-              "api-reference/endpoint/get",
-              "api-reference/endpoint/create",
-              "api-reference/endpoint/delete",
-              "api-reference/endpoint/webhook"
+              "api/python/datasets",
+              "api/python/query-builder",
+              "api/python/processors"
             ]
           }
         ]
       }
-    ],
-    "global": {
-      "anchors": [
-        {
-          "anchor": "Documentation",
-          "href": "https://mintlify.com/docs",
-          "icon": "book-open-cover"
-        },
-        {
-          "anchor": "Blog",
-          "href": "https://mintlify.com/blog",
-          "icon": "newspaper"
-        }
-      ]
-    }
-  },
-  "logo": {
-    "light": "/logo/light.svg",
-    "dark": "/logo/dark.svg"
-  },
-  "navbar": {
-    "links": [
-      {
-        "label": "Support",
-        "href": "mailto:hi@mintlify.com"
-      }
-    ],
-    "primary": {
-      "type": "button",
-      "label": "Dashboard",
-      "href": "https://dashboard.mintlify.com"
-    }
-  },
-  "contextual": {
-    "options": [
-     "copy",
-     "view",
-     "chatgpt",
-     "claude",
-     "perplexity",
-     "mcp",
-     "cursor",
-     "vscode"
-   ]
-  },
-  "footer": {
-    "socials": {
-      "x": "https://x.com/mintlify",
-      "github": "https://github.com/mintlify",
-      "linkedin": "https://linkedin.com/company/mintlify"
-    }
+    ]
   }
 }

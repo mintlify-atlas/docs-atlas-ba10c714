@@ -1,0 +1,667 @@
+---
+title: Monitoring and Observability
+description: Monitor Snuba health, performance, and data pipeline metrics with comprehensive observability
+---
+
+Snuba provides extensive monitoring capabilities through metrics, health checks, and distributed tracing. This guide covers monitoring setup, key metrics, and operational alerts.
+
+## Metrics Architecture
+
+Snuba emits metrics to DataDog (StatsD protocol) for monitoring and alerting.
+
+### Metrics Configuration
+
+```python
+# Configure DataDog metrics
+DOGSTATSD_HOST = "localhost"
+DOGSTATSD_PORT = 8125
+
+# Sample rates for high-volume metrics
+DOGSTATSD_SAMPLING_RATES = {
+    "metrics.processor.set.size": 0.1,
+    "metrics.processor.distribution.size": 0.1,
+    "off_peak_rejected": 0.01,
+}
+
+# DDM metrics sample rate
+DDM_METRICS_SAMPLE_RATE = 0.01
+```
+
+### Metric Types
+
+Snuba emits four types of metrics:
+
+<Accordion title="Counters">
+Incremental counters for event tracking:
+
+```python
+metrics.increment("healthcheck_failed", tags={"reason": "clickhouse_timeout"})
+metrics.increment("consumer.message_processed", tags={"storage": "errors"})
+```
+
+Key counters:
+- `consumer.message_processed`: Messages consumed from Kafka
+- `consumer.message_filtered`: Messages filtered before processing
+- `healthcheck_failed`: Failed health checks
+- `query.success`: Successful queries
+- `query.error`: Failed queries
+</Accordion>
+
+<Accordion title="Timers/Distributions">
+Timing and distribution metrics:
+
+```python
+metrics.timing("query.duration", duration_ms, tags={"referrer": "api"})
+metrics.timing("healthcheck.latency", latency_seconds)
+```
+
+Key timers:
+- `query.duration`: Query execution time
+- `consumer.batch_time`: Consumer batch processing time
+- `clickhouse.query.duration`: ClickHouse query execution time
+- `healthcheck.latency`: Health check response time
+</Accordion>
+
+<Accordion title="Gauges">
+Point-in-time measurements:
+
+```python
+metrics.gauge("consumer.lag", lag_messages, tags={"partition": "0"})
+metrics.gauge("consumer.offset", current_offset)
+```
+
+Key gauges:
+- `consumer.lag`: Kafka consumer lag in messages
+- `consumer.batch_size`: Current batch size
+- `clickhouse.connections`: Active ClickHouse connections
+</Accordion>
+
+<Accordion title="Sets">
+Unique value counting:
+
+```python
+metrics.set("query.project_id", project_id, tags={"dataset": "events"})
+```
+</Accordion>
+
+## Health Monitoring
+
+### Health Check Endpoints
+
+Snuba provides multiple health check endpoints:
+
+#### Basic Health Check
+
+Quick sanity check that at least one ClickHouse node is responsive:
+
+```bash
+curl http://localhost:1218/health
+```
+
+```json
+{
+  "status": "ok",
+  "down_file_exists": false
+}
+```
+
+**Checks performed:**
+- At least one ClickHouse cluster is reachable
+- Can execute `SHOW TABLES` query
+- Timeout: 500ms per cluster (configurable)
+
+#### Thorough Health Check
+
+Comprehensive check that verifies all required tables exist:
+
+```bash
+curl "http://localhost:1218/health?thorough=true"
+```
+
+```json
+{
+  "status": "ok",
+  "down_file_exists": false,
+  "clickhouse_ok": true
+}
+```
+
+**Checks performed:**
+- All enabled storage tables exist in ClickHouse
+- All query nodes are accessible
+- All storage nodes are healthy
+- Verifies table schema integrity
+
+<Warning>
+Thorough health checks can take several seconds. Use basic health checks for load balancer probes and thorough checks for deployment validation.
+</Warning>
+
+#### Envoy Health Check
+
+Special endpoint for Envoy/load balancer integration:
+
+```bash
+curl http://localhost:1218/health_envoy
+```
+
+This endpoint is designed to work with load balancer health checking patterns.
+
+### CLI Health Check
+
+Run health checks from the command line:
+
+```bash
+# Basic health check
+snuba health
+
+# Thorough health check
+snuba health --thorough
+
+# Exit code 0 = healthy, 1 = unhealthy
+```
+
+### Health Check Configuration
+
+Customize health check behavior via runtime config:
+
+```python
+# Ignore ClickHouse health (emergency use only)
+health_check_ignore_clickhouse = 1
+
+# Override health check timeout
+health_check.timeout_override_seconds = 1.0
+```
+
+## Key Metrics to Monitor
+
+### API Performance Metrics
+
+<Steps>
+
+<Step title="Query Rate">
+Monitor query throughput:
+
+```
+sum:snuba.query.success{*} by {dataset,referrer}
+sum:snuba.query.error{*} by {dataset,error_type}
+```
+
+**Alert on:**
+- Sudden drops in query rate (> 50% decrease)
+- High error rates (> 5% of total queries)
+</Step>
+
+<Step title="Query Latency">
+Track query performance:
+
+```
+avg:snuba.query.duration{*} by {dataset,referrer}
+p95:snuba.query.duration{*} by {dataset,referrer}
+p99:snuba.query.duration{*} by {dataset,referrer}
+```
+
+**Alert on:**
+- P95 latency > 5 seconds
+- P99 latency > 10 seconds
+- Sudden latency spikes (> 3x baseline)
+</Step>
+
+<Step title="ClickHouse Query Performance">
+Monitor database execution time:
+
+```
+avg:snuba.clickhouse.query.duration{*} by {cluster}
+p95:snuba.clickhouse.query.duration{*}
+```
+
+**Alert on:**
+- Average query time > 2 seconds
+- P95 query time > 5 seconds
+</Step>
+
+<Step title="API Error Rate">
+Track API errors:
+
+```
+sum:snuba.query.error{*} by {error_type}
+```
+
+**Common error types:**
+- `rate_limited`: Query rate limited
+- `timeout`: Query timed out
+- `clickhouse_error`: ClickHouse query failed
+- `invalid_query`: Malformed query
+</Step>
+
+</Steps>
+
+### Consumer Pipeline Metrics
+
+<Steps>
+
+<Step title="Consumer Lag">
+Most critical metric for data freshness:
+
+```
+max:snuba.consumer.lag{*} by {consumer_group,partition,storage}
+```
+
+**Alert on:**
+- Lag > 1,000,000 messages (warning)
+- Lag > 5,000,000 messages (critical)
+- Lag growing consistently over 15 minutes
+
+<Note>
+Consumer lag indicates how far behind Kafka the consumer is. High lag means delayed data visibility.
+</Note>
+</Step>
+
+<Step title="Message Processing Rate">
+Track ingestion throughput:
+
+```
+sum:snuba.consumer.message_processed{*} by {storage,consumer_group}
+sum:snuba.consumer.message_filtered{*} by {storage}
+```
+
+**Alert on:**
+- Processing rate drops to 0 (consumer stuck)
+- Processing rate < expected load
+</Step>
+
+<Step title="Batch Processing Time">
+Monitor consumer performance:
+
+```
+avg:snuba.consumer.batch_time{*} by {storage,consumer_group}
+p95:snuba.consumer.batch_time{*}
+```
+
+**Alert on:**
+- Average batch time > 5 seconds
+- P95 batch time > 10 seconds
+</Step>
+
+<Step title="Consumer Errors">
+Track processing failures:
+
+```
+sum:snuba.consumer.error{*} by {storage,error_type}
+sum:snuba.consumer.invalid_message{*} by {storage}
+```
+
+**Alert on:**
+- Error rate > 1% of processed messages
+- Persistent errors over 5 minutes
+</Step>
+
+</Steps>
+
+### ClickHouse Health Metrics
+
+<Steps>
+
+<Step title="Connection Pool">
+Monitor ClickHouse connections:
+
+```
+max:snuba.clickhouse.connections{*} by {cluster}
+avg:snuba.clickhouse.connection_wait_time{*}
+```
+
+**Alert on:**
+- Connections at max pool size
+- High connection wait times (> 100ms)
+</Step>
+
+<Step title="Query Failures">
+Track ClickHouse errors:
+
+```
+sum:snuba.clickhouse.query.error{*} by {cluster,error_code}
+```
+
+**Common error codes:**
+- `241`: Memory limit exceeded
+- `159`: Query timeout
+- `60`: Too many simultaneous queries
+</Step>
+
+<Step title="Table Operations">
+Monitor table health:
+
+```
+sum:snuba.clickhouse.merge{*} by {table}
+sum:snuba.clickhouse.mutation{*} by {table}
+```
+
+**Alert on:**
+- Long-running merges (> 4 hours)
+- Too many concurrent mutations (> 5)
+</Step>
+
+</Steps>
+
+### System Resource Metrics
+
+```
+# Memory usage
+avg:process.memory.rss{service:snuba} by {pod_name}
+
+# CPU usage
+avg:system.cpu.usage{service:snuba} by {pod_name}
+
+# Disk I/O
+sum:system.io.rkb{service:clickhouse} by {device}
+sum:system.io.wkb{service:clickhouse} by {device}
+```
+
+## Production Alerts
+
+### Critical Alerts
+
+Alerts that require immediate response:
+
+<Accordion title="High API Error Rate">
+**Alert**: SLO - High API error rate
+
+```
+sum(last_15m):sum:snuba.query.error{*}.as_count() / 
+  sum:snuba.query.total{*}.as_count() > 0.05
+```
+
+**Threshold**: Error rate > 5% for 15 minutes
+
+**Response**:
+1. Check ClickHouse health
+2. Review error logs for common patterns
+3. Check for recent deployments
+4. Verify network connectivity
+</Accordion>
+
+<Accordion title="Consumer Lag Critical">
+**Alert**: Consumer lag exceeding threshold
+
+```
+max(last_15m):max:snuba.consumer.lag{*} by {storage} > 5000000
+```
+
+**Threshold**: Lag > 5M messages for 15 minutes
+
+**Response**:
+1. Scale consumer replicas
+2. Check consumer error rates
+3. Verify Kafka broker health
+4. Review ClickHouse insert performance
+</Accordion>
+
+<Accordion title="Pod Restart Loop">
+**Alert**: Too many restarts on Snuba pods
+
+```
+change(sum(last_5m),last_5m):
+  kubernetes.containers.restarts{kube_container_name:snuba-*} > 3
+```
+
+**Threshold**: > 3 restarts in 5 minutes
+
+**Response**:
+1. Check pod logs for crash reason
+2. Review resource limits (OOM?)
+3. Check health check configuration
+4. Verify dependencies (ClickHouse, Redis, Kafka)
+</Accordion>
+
+<Accordion title="ClickHouse Connection Failures">
+**Alert**: Cannot connect to ClickHouse
+
+```
+sum(last_5m):sum:snuba.healthcheck_failed{
+  clickhouse_ok:false
+}.as_count() > 10
+```
+
+**Threshold**: > 10 failed health checks in 5 minutes
+
+**Response**:
+1. Verify ClickHouse is running
+2. Check network connectivity
+3. Review ClickHouse logs
+4. Check authentication credentials
+</Accordion>
+
+### Warning Alerts
+
+Alerts requiring investigation but not immediate action:
+
+```
+# Query latency degradation
+p95:snuba.query.duration{*} > 5000
+
+# Consumer batch size too large
+avg:snuba.consumer.batch_size{*} > 100000
+
+# Memory usage high
+avg:process.memory.rss{service:snuba} > 3.5e9
+
+# ClickHouse merge operations taking long
+avg:snuba.clickhouse.merge.duration{*} > 14400000
+```
+
+## DataDog Integration
+
+### Health Check Monitor
+
+Create a DataDog monitor to check Snuba health:
+
+```bash
+# Monitor IDs used in production
+# 113296727: Snuba - SLO - High API error rate
+# 42722121: Snuba - Too many restarts on Snuba pods
+
+# Check monitor status before deployment
+checks-datadog-monitor-status \
+  113296727 \
+  42722121
+```
+
+### Custom Dashboards
+
+Key dashboard widgets:
+
+```
+1. Query Rate by Dataset
+   - Metric: sum:snuba.query.success{*} by {dataset}
+   - Visualization: Timeseries
+
+2. Query Latency P95
+   - Metric: p95:snuba.query.duration{*}
+   - Visualization: Timeseries with threshold lines
+
+3. Consumer Lag
+   - Metric: max:snuba.consumer.lag{*} by {storage}
+   - Visualization: Timeseries with log scale
+
+4. Error Rate
+   - Metric: sum:snuba.query.error{*}.as_rate()
+   - Visualization: Query value with threshold
+
+5. ClickHouse Query Time
+   - Metric: avg:snuba.clickhouse.query.duration{*}
+   - Visualization: Heatmap
+```
+
+## Distributed Tracing
+
+### Sentry Integration
+
+Snuba automatically sends traces to Sentry:
+
+```python
+# Configure Sentry tracing
+SENTRY_DSN = "https://key@sentry.io/project"
+SENTRY_TRACE_SAMPLE_RATE = 0.1  # Sample 10% of transactions
+
+# Admin UI tracing
+ADMIN_TRACE_SAMPLE_RATE = 1.0
+ADMIN_PROFILES_SAMPLE_RATE = 1.0
+```
+
+### Trace Context
+
+Snuba includes rich context in traces:
+
+- **Query**: Full query text and parameters
+- **Dataset**: Which dataset was queried
+- **Storage**: Which ClickHouse storage was used
+- **Referrer**: Query origin/caller
+- **Project IDs**: Projects involved in query
+- **Timing Breakdown**: Time spent in each phase
+
+### Performance Profiling
+
+Enable profiling for performance debugging:
+
+```bash
+# Enable heap profiling
+export ENABLE_HEAPTRACK=1
+snuba api
+
+# Profiles written to ./profiler_data/
+# Analyze with heaptrack_gui
+heaptrack_gui ./profiler_data/profile_*.gz
+```
+
+## Logging
+
+### Log Levels
+
+Configure logging verbosity:
+
+```bash
+# Environment variable
+export LOG_LEVEL=INFO
+
+# CLI option
+snuba api --log-level=debug
+
+# Available levels: DEBUG, INFO, WARNING, ERROR, CRITICAL
+```
+
+### Structured Logging
+
+Snuba uses structured logging with key context:
+
+```json
+{
+  "timestamp": "2026-03-09T10:30:45.123Z",
+  "level": "info",
+  "logger": "snuba.query",
+  "message": "Query executed successfully",
+  "query_id": "abc123",
+  "dataset": "events",
+  "duration_ms": 145,
+  "referrer": "api.organization-events"
+}
+```
+
+### Important Log Patterns
+
+<Warning>
+**Critical log patterns to alert on:**
+
+```bash
+# ClickHouse connection errors
+"ERROR" AND "ClickhouseError" AND "Connection"
+
+# Query timeouts
+"ERROR" AND "timeout" AND "query"
+
+# Consumer processing errors
+"ERROR" AND "consumer" AND "processing"
+
+# Migration failures
+"ERROR" AND "migration" AND "failed"
+```
+</Warning>
+
+## Query Performance Monitoring
+
+### Slow Query Logging
+
+Snuba automatically logs slow queries:
+
+```python
+# Queries taking > 10s are logged with full details
+logger.warning(
+    "Slow query detected",
+    extra={
+        "query_id": query_id,
+        "duration_ms": duration,
+        "query": query_text,
+        "referrer": referrer,
+    }
+)
+```
+
+### Query Recording
+
+Enable query recording for debugging:
+
+```python
+RECORD_QUERIES = True
+
+# Queries will be stored with execution plans
+# Useful for performance analysis and optimization
+```
+
+### Cost of Goods Sold (COGS) Tracking
+
+Track query costs:
+
+```python
+RECORD_COGS = True
+
+# Tracks resource usage per query:
+# - CPU time
+# - Memory usage
+# - Rows scanned
+# - Bytes processed
+```
+
+## Operational Runbooks
+
+### High Consumer Lag
+
+1. **Identify lag source**: Check which storage has lag
+2. **Scale consumers**: Increase consumer replicas
+3. **Check ClickHouse**: Verify insert performance
+4. **Review batch sizes**: May need to increase batch size
+5. **Check for slow queries**: Blocking queries can delay inserts
+
+### API Error Rate Spike
+
+1. **Check error types**: Identify common error pattern
+2. **Verify ClickHouse**: Ensure database is healthy
+3. **Review recent changes**: Check for bad deployments
+4. **Check rate limits**: May need to adjust limits
+5. **Monitor resource usage**: CPU/memory exhaustion?
+
+### ClickHouse Connection Issues
+
+1. **Verify connectivity**: Test network path
+2. **Check credentials**: Ensure auth is correct
+3. **Review connection pool**: May need larger pool
+4. **Check ClickHouse logs**: Look for server errors
+5. **Verify DNS resolution**: Ensure hostname resolves
+
+## Best Practices
+
+1. **Monitor consumer lag continuously** - This is your most important metric
+2. **Set up PagerDuty/OpsGenie integration** for critical alerts
+3. **Use log aggregation** (Datadog Logs, Elasticsearch) for debugging
+4. **Create custom dashboards** for each team's use cases
+5. **Review slow query logs weekly** to identify optimization opportunities
+6. **Test alerts in staging** before deploying to production
+7. **Document runbooks** for each critical alert
+8. **Set up synthetic monitoring** to test query paths proactively

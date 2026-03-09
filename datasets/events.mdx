@@ -1,0 +1,489 @@
+---
+title: "Events Dataset"
+description: "Error and exception data with stack traces, user context, and comprehensive debugging information"
+---
+
+<Note>
+The events dataset stores error and exception data from Sentry, including stack traces, exception details, user context, and custom tags. It's the foundational dataset that powers Sentry's error monitoring features.
+</Note>
+
+## Overview
+
+The events dataset is designed for querying error events with rich contextual information. Each event represents a single error occurrence captured by Sentry's SDKs.
+
+### Key Characteristics
+
+- **Storage**: Primary storage in `errors` table with read-only replica `errors_ro`
+- **Entity**: Single `events` entity
+- **Partitioning**: By retention_days and date
+- **Primary Use Cases**: Error search, issue aggregation, debugging workflows
+
+## Entity: events
+
+The events entity provides the query interface for error data.
+
+### Core Columns
+
+#### Identification
+
+```yaml
+event_id: UUID              # Unique identifier for the event
+project_id: UInt64          # Required for all queries
+group_id: UInt64            # Issue/group this event belongs to
+primary_hash: UUID          # Hash used for grouping
+```
+
+#### Timestamps
+
+```yaml
+timestamp: DateTime         # When the event occurred (required)
+received: DateTime          # When Snuba received the event
+message_timestamp: DateTime # Kafka message timestamp
+```
+
+<Note>
+**timestamp** is the required time column for all time-based queries. It represents when the error actually occurred.
+</Note>
+
+#### Error Details
+
+```yaml
+message: String            # Error message
+title: String              # Event title
+culprit: String            # Function/location that caused the error
+level: String              # Error severity (fatal, error, warning, info, debug)
+type: String               # Event type identifier
+location: String           # Source location
+```
+
+#### User Context
+
+```yaml
+user: String               # User identifier (promoted from tags)
+user_id: String            # User ID
+user_name: String          # Username
+user_email: String         # User email
+user_hash: UInt64          # Hash of user identifier (readonly)
+```
+
+#### HTTP Context
+
+```yaml
+http_method: String        # HTTP request method
+http_referer: String       # HTTP referer header
+ip_address_v4: IPv4        # Client IPv4 address
+ip_address_v6: IPv6        # Client IPv6 address
+```
+
+#### SDK Information
+
+```yaml
+platform: String           # Platform (python, javascript, etc.)
+sdk_name: String           # SDK name (sentry.python, etc.)
+sdk_version: String        # SDK version
+sdk_integrations: Array    # Enabled SDK integrations
+```
+
+#### Release Context
+
+```yaml
+release: String            # Release version (promoted from tags)
+environment: String        # Environment name (promoted from tags)
+dist: String               # Distribution identifier (promoted from tags)
+version: String            # Additional version field
+```
+
+### Nested Structures
+
+#### Tags
+
+```yaml
+tags: Nested(
+  key: String,
+  value: String
+)
+_tags_hash_map: Array(UInt64)  # Optimization for tag lookups
+```
+
+Tags store custom key-value metadata. Some tags are "promoted" to top-level columns:
+
+- `sentry:release` → `release`
+- `sentry:dist` → `dist`
+- `sentry:user` → `user`
+- `environment` → `environment`
+- `level` → `level`
+
+#### Contexts
+
+```yaml
+contexts: Nested(
+  key: String,
+  value: String
+)
+```
+
+Contexts store structured data like:
+- `geo.country_code`, `geo.region`, `geo.city` - Geographic information
+- `trace.trace_id`, `trace.span_id` - Distributed tracing data
+- Custom context data
+
+#### Exception Stacks
+
+```yaml
+exception_stacks: Nested(
+  type: String,
+  value: String,
+  mechanism_type: String,
+  mechanism_handled: UInt8
+)
+```
+
+Stores exception information including type, message, and handling mechanism.
+
+#### Exception Frames
+
+```yaml
+exception_frames: Nested(
+  abs_path: String,
+  filename: String,
+  function: String,
+  lineno: UInt32,
+  colno: UInt32,
+  in_app: UInt8,
+  package: String,
+  module: String,
+  stack_level: UInt16
+)
+```
+
+Stack trace frames with source location and context.
+
+#### Modules
+
+```yaml
+modules: Nested(
+  name: String,
+  version: String
+)
+```
+
+Installed packages/modules at the time of the error.
+
+### Tracing & Replay Integration
+
+```yaml
+trace_id: UUID             # Distributed trace ID
+span_id: UInt64            # Span ID within trace
+trace_sampled: UInt8       # Whether trace was sampled
+replay_id: UUID            # Associated session replay
+transaction_name: String   # Associated transaction name
+transaction_hash: UInt64   # Hash of transaction name
+```
+
+### Processing Metadata
+
+```yaml
+partition: UInt16          # Kafka partition
+offset: UInt64             # Kafka offset
+retention_days: UInt16     # Data retention period
+deleted: UInt8             # Soft delete flag
+num_processing_errors: UInt64  # Errors during processing
+```
+
+## Storage: errors
+
+The primary writable storage for event data.
+
+### Table Structure
+
+```sql
+CREATE TABLE errors_local (
+    project_id UInt64,
+    timestamp DateTime,
+    event_id UUID,
+    -- ... other columns
+) ENGINE = ReplacingMergeTree()
+PARTITION BY (retention_days, toMonday(timestamp))
+ORDER BY (project_id, toStartOfDay(timestamp), event_id)
+```
+
+### Storage Configuration
+
+```yaml
+storage:
+  key: errors
+  set_key: events
+readiness_state: complete
+local_table_name: errors_local
+dist_table_name: errors_dist
+partition_format:
+  - retention_days
+  - date
+not_deleted_mandatory_condition: deleted
+```
+
+### Replacer System
+
+The errors storage uses a replacer processor to handle event updates and deletions:
+
+```yaml
+replacer_processor:
+  processor: ErrorsReplacer
+  args:
+    state_name: errors
+    storage_key_str: errors
+```
+
+This enables:
+- Soft deletion of events
+- Group ID updates when issues are merged
+- Metadata corrections
+
+## Query Processors
+
+Events storage applies multiple query processors for optimization:
+
+### UUID Processing
+
+```yaml
+- processor: UUIDColumnProcessor
+  args:
+    columns: [event_id, primary_hash, trace_id, replay_id]
+```
+
+Converts UUID strings to binary format for efficient storage.
+
+### Mapping Optimization
+
+```yaml
+- processor: MappingOptimizer
+  args:
+    column_name: tags
+    hash_map_name: _tags_hash_map
+    killswitch: events_tags_hash_map_enabled
+```
+
+Uses hash maps for fast tag lookups when enabled.
+
+### Prewhere Optimization
+
+```yaml
+- processor: PrewhereProcessor
+  args:
+    prewhere_candidates:
+      - event_id
+      - trace_id
+      - group_id
+      - release
+      - message
+```
+
+Moves selective filters to ClickHouse's PREWHERE clause for faster execution.
+
+## Allocation Policies
+
+The errors storage enforces resource limits:
+
+```yaml
+allocation_policies:
+  - name: ConcurrentRateLimitAllocationPolicy
+    required_tenant_types:
+      - organization_id
+      - referrer
+      - project_id
+  - name: BytesScannedRejectingPolicy
+    default_config_overrides:
+      is_enforced: 1
+  - name: CrossOrgQueryAllocationPolicy
+    default_config_overrides:
+      is_enforced: 1
+```
+
+## Data Ingestion
+
+### Stream Loader
+
+```yaml
+stream_loader:
+  processor: ErrorsProcessor
+  default_topic: events
+  replacement_topic: event-replacements
+  commit_log_topic: snuba-commit-log
+  subscription_scheduler_mode: partition
+```
+
+### Message Format
+
+Events are ingested from Kafka in the following format:
+
+```json
+[
+  2,
+  "insert",
+  {
+    "project_id": 1,
+    "event_id": "abc123...",
+    "data": {
+      "timestamp": 1647532800.0,
+      "message": "Division by zero",
+      "exception": {
+        "values": [...]
+      },
+      "tags": {
+        "environment": "production",
+        "level": "error"
+      },
+      "user": {
+        "id": "user123",
+        "email": "user@example.com"
+      }
+    }
+  }
+]
+```
+
+## Example Queries
+
+### Find events by event ID
+
+```sql
+MATCH (events)
+SELECT event_id, message, timestamp, group_id
+WHERE project_id = 1
+  AND event_id = 'abc123...'
+  AND timestamp >= toDateTime('2024-01-01 00:00:00')
+  AND timestamp < toDateTime('2024-01-02 00:00:00')
+```
+
+### Group errors by level
+
+```sql
+MATCH (events)
+SELECT level, count() as error_count
+WHERE project_id = 1
+  AND timestamp >= toDateTime('2024-01-01 00:00:00')
+  AND timestamp < toDateTime('2024-01-02 00:00:00')
+GROUP BY level
+ORDER BY error_count DESC
+```
+
+### Search by tag
+
+```sql
+MATCH (events)
+SELECT event_id, message, tags[environment] as env
+WHERE project_id = 1
+  AND timestamp >= toDateTime('2024-01-01 00:00:00')
+  AND timestamp < toDateTime('2024-01-02 00:00:00')
+  AND tags[environment] = 'production'
+LIMIT 100
+```
+
+### Find events with specific exception type
+
+```sql
+MATCH (events)
+SELECT event_id, message, exception_stacks.type
+WHERE project_id = 1
+  AND timestamp >= toDateTime('2024-01-01 00:00:00')
+  AND timestamp < toDateTime('2024-01-02 00:00:00')
+  AND arrayExists(x -> x = 'ZeroDivisionError', exception_stacks.type)
+LIMIT 100
+```
+
+### Aggregate by user
+
+```sql
+MATCH (events)
+SELECT user_email, count() as event_count
+WHERE project_id = 1
+  AND timestamp >= toDateTime('2024-01-01 00:00:00')
+  AND timestamp < toDateTime('2024-01-02 00:00:00')
+  AND user_email != ''
+GROUP BY user_email
+ORDER BY event_count DESC
+LIMIT 20
+```
+
+## Join Relationships
+
+The events entity supports joins with related datasets:
+
+```yaml
+join_relationships:
+  grouped:
+    rhs_entity: groupedmessage
+    join_type: inner
+    columns:
+      - [project_id, project_id]
+      - [group_id, id]
+  assigned:
+    rhs_entity: groupassignee
+    join_type: inner
+    columns:
+      - [project_id, project_id]
+      - [group_id, group_id]
+  attributes:
+    rhs_entity: group_attributes
+    join_type: left
+    columns:
+      - [project_id, project_id]
+      - [group_id, group_id]
+```
+
+## Subscriptions
+
+The events entity supports subscriptions for real-time alerting:
+
+```yaml
+subscription_validators:
+  - validator: AggregationValidator
+    args:
+      max_allowed_aggregations: 10
+      disallowed_aggregations:
+        - having
+        - orderby
+      required_time_column: timestamp
+      allows_group_by_without_condition: true
+```
+
+## Performance Considerations
+
+<AccordionGroup>
+  <Accordion title="Always filter by project_id">
+    The project_id filter is mandatory and critical for query performance. It's enforced by the EntityRequiredColumnValidator.
+  </Accordion>
+  
+  <Accordion title="Use reasonable time ranges">
+    Limit timestamp ranges to avoid scanning excessive partitions. Most queries should be < 90 days.
+  </Accordion>
+  
+  <Accordion title="Leverage promoted tags">
+    Use promoted columns (release, environment, user) instead of tag subscripts when possible for better performance.
+  </Accordion>
+  
+  <Accordion title="Use event_id for point queries">
+    When looking up specific events, include event_id in the WHERE clause to enable prewhere optimization.
+  </Accordion>
+  
+  <Accordion title="Beware of high cardinality">
+    Avoid grouping by high-cardinality columns like event_id or user_email without additional filters.
+  </Accordion>
+</AccordionGroup>
+
+## Related Resources
+
+<CardGroup cols={2}>
+  <Card title="Transactions Dataset" icon="gauge-high" href="/datasets/transactions">
+    Performance data linked via trace_id
+  </Card>
+  <Card title="Replays Dataset" icon="circle-play" href="/datasets/replays">
+    Session replays linked via replay_id
+  </Card>
+  <Card title="Query Optimization" icon="gauge-high" href="/query/optimization">
+    Learn about query optimization strategies
+  </Card>
+  <Card title="SnQL Reference" icon="code" href="/query/snql">
+    Full SnQL language reference
+  </Card>
+</CardGroup>

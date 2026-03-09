@@ -1,0 +1,272 @@
+---
+title: "CLI Overview"
+description: "Comprehensive guide to Snuba's command-line interface and available commands"
+---
+
+## Introduction
+
+Snuba provides a powerful command-line interface (CLI) for managing all aspects of the application, from running services to managing migrations and consuming Kafka streams. The CLI is built using Click and follows a plugin-based architecture where each command is a separate module.
+
+## CLI Architecture
+
+The Snuba CLI uses a dynamic command loading system defined in `snuba/cli/__init__.py:29`. Commands are automatically discovered from Python files in the `cli` directory, with underscores converted to dashes (e.g., `rust_consumer.py` becomes `rust-consumer`).
+
+```bash
+# Main CLI entry point
+snuba [OPTIONS] COMMAND [ARGS]...
+```
+
+## Available Commands
+
+Snuba provides the following command categories:
+
+### Core Service Commands
+
+<CardGroup cols={2}>
+  <Card title="api" icon="server" href="#api-server">
+    Run the main Snuba HTTP API server
+  </Card>
+  <Card title="admin" icon="shield" href="/cli/admin">
+    Run the administrative web interface
+  </Card>
+  <Card title="devserver" icon="laptop-code" href="/cli/devserver">
+    Start all services for local development
+  </Card>
+</CardGroup>
+
+### Data Processing Commands
+
+<CardGroup cols={2}>
+  <Card title="consumer" icon="inbox" href="/cli/consumer">
+    Python-based Kafka consumer for event processing
+  </Card>
+  <Card title="rust-consumer" icon="gear" href="/cli/consumer#rust-consumer">
+    High-performance Rust-based consumer
+  </Card>
+  <Card title="replacer" icon="rotate">
+    Process replacement messages for data updates
+  </Card>
+  <Card title="subscriptions-executor" icon="bell">
+    Execute scheduled subscription queries
+  </Card>
+</CardGroup>
+
+### Database Management
+
+<CardGroup cols={2}>
+  <Card title="migrations" icon="database" href="/cli/migrations">
+    Manage ClickHouse schema migrations
+  </Card>
+  <Card title="bootstrap" icon="rocket">
+    Initialize Kafka topics and run migrations
+  </Card>
+</CardGroup>
+
+## Command Features
+
+### Auto-Initialization
+
+All commands automatically initialize Snuba's core components before execution. This includes:
+
+- Setting up Sentry error tracking
+- Configuring structured logging
+- Initializing metrics collection
+- Loading storage and dataset factories
+
+The initialization time is tracked and logged for each command execution.
+
+### Logging Configuration
+
+Most commands support the `--log-level` option to control output verbosity:
+
+```bash
+snuba consumer --log-level debug --storage errors
+```
+
+Available log levels:
+- `critical` - Only critical errors
+- `error` - Error messages
+- `warning` - Warnings and errors  
+- `info` - Informational messages (default)
+- `debug` - Detailed debugging information
+- `trace` - Verbose trace-level logging (Rust consumers)
+
+## API Server
+
+The main HTTP API server that handles query requests:
+
+```bash
+snuba api [OPTIONS]
+```
+
+<ParamField path="--bind" type="string">
+  Address to listen on in format `host:port`
+</ParamField>
+
+<ParamField path="--debug" type="flag">
+  Enable debug mode with auto-reload (development only)
+</ParamField>
+
+<ParamField path="--log-level" type="string">
+  Logging level (critical, error, warning, info, debug)
+</ParamField>
+
+<ParamField path="--processes" type="integer" default="1">
+  Number of worker processes (min: 1)
+</ParamField>
+
+<ParamField path="--threads" type="integer">
+  Number of threads per process (min: 1)
+</ParamField>
+
+<ParamField path="--backlog" type="integer">
+  Socket connection backlog (min: 128)
+</ParamField>
+
+### Examples
+
+<CodeGroup>
+```bash Development Mode
+# Run in debug mode with auto-reload
+snuba api --debug --log-level debug
+```
+
+```bash Production Mode  
+# Run with multiple workers
+snuba api --bind 0.0.0.0:1218 --processes 4 --threads 8
+```
+
+```bash Custom Configuration
+# Bind to specific address with custom backlog
+snuba api --bind 127.0.0.1:8080 --backlog 256
+```
+</CodeGroup>
+
+<Note>
+  In debug mode, only a single process and thread can be used. The server will automatically reload when code changes are detected.
+</Note>
+
+## Bootstrap
+
+Initialize Snuba's infrastructure by creating Kafka topics and running migrations:
+
+```bash
+snuba bootstrap [OPTIONS]
+```
+
+<ParamField path="--bootstrap-server" type="string" multiple>
+  Kafka bootstrap servers (can be specified multiple times)
+</ParamField>
+
+<ParamField path="--kafka/--no-kafka" type="boolean" default="true">
+  Whether to create Kafka topics
+</ParamField>
+
+<ParamField path="--migrate/--no-migrate" type="boolean" default="true">
+  Whether to run database migrations
+</ParamField>
+
+<ParamField path="--force" type="flag" required>
+  Required flag to confirm bootstrap operation
+</ParamField>
+
+<ParamField path="--log-level" type="string">
+  Logging level to use
+</ParamField>
+
+### Examples
+
+<CodeGroup>
+```bash Full Bootstrap
+# Initialize everything (Kafka + migrations)
+snuba bootstrap --force --bootstrap-server kafka:9092
+```
+
+```bash Kafka Only
+# Create Kafka topics without running migrations
+snuba bootstrap --force --no-migrate --bootstrap-server kafka:9092
+```
+
+```bash Migrations Only
+# Run migrations without creating Kafka topics
+snuba bootstrap --force --no-kafka
+```
+</CodeGroup>
+
+<Warning>
+  The `--force` flag is required as this command can modify infrastructure. Not intended for production use - use targeted migration commands instead.
+</Warning>
+
+## Common Patterns
+
+### Storage Selection
+
+Many commands require specifying a storage target:
+
+```bash
+snuba consumer --storage errors
+snuba consumer --storage transactions
+snuba rust-consumer --storage outcomes_raw
+```
+
+Available storages can be listed using the `entities` command.
+
+### Kafka Configuration
+
+Commands that interact with Kafka support multiple bootstrap servers:
+
+```bash
+snuba consumer \
+  --storage errors \
+  --bootstrap-server kafka1:9092 \
+  --bootstrap-server kafka2:9092 \
+  --bootstrap-server kafka3:9092
+```
+
+### Health Checks
+
+Consumer commands support health check files for orchestration:
+
+```bash
+snuba rust-consumer \
+  --storage errors \
+  --consumer-group errors_group \
+  --health-check-file /tmp/snuba-health
+```
+
+The consumer will periodically touch this file to indicate it's healthy.
+
+## Version Information
+
+Display Snuba version:
+
+```bash
+snuba --version
+```
+
+## Getting Help
+
+Every command supports the `--help` flag:
+
+```bash
+snuba --help              # List all commands
+snuba consumer --help     # Command-specific help
+snuba migrations --help   # Subcommand help
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Consumer Commands" icon="inbox" href="/cli/consumer">
+    Learn about Kafka consumers and event processing
+  </Card>
+  <Card title="Migrations" icon="database" href="/cli/migrations">
+    Manage database schema changes
+  </Card>
+  <Card title="Development Server" icon="laptop-code" href="/cli/devserver">
+    Set up local development environment
+  </Card>
+  <Card title="Admin Interface" icon="shield" href="/cli/admin">
+    Administrative tools and interfaces
+  </Card>
+</CardGroup>

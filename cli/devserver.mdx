@@ -1,0 +1,509 @@
+---
+title: "Development Server"
+description: "Start all Snuba services for local development with a single command"
+---
+
+## Overview
+
+The `devserver` command provides a convenient way to start all necessary Snuba services for local development. It handles bootstrapping, migrations, and orchestrates multiple processes including the API server, consumers, and background workers.
+
+```bash
+snuba devserver [OPTIONS]
+```
+
+This command uses [Honcho](https://github.com/nickstenning/honcho) to manage multiple processes and provides a unified console output showing logs from all services.
+
+## Options
+
+<ParamField path="--bootstrap/--no-bootstrap" type="boolean" default="true">
+  Whether to run bootstrap operations before starting services.
+  
+  Bootstrap includes:
+  - Creating Kafka topics (unless `--no-migrate` is used with bootstrap)
+  - Running database migrations
+  
+  Use `--no-bootstrap` to skip initialization if your environment is already set up.
+</ParamField>
+
+<ParamField path="--workers/--no-workers" type="boolean" default="true">
+  Whether to start background workers (consumers, subscriptions, etc.).
+  
+  With `--workers`: Starts all services including consumers and processors
+  With `--no-workers`: Starts only the API server
+</ParamField>
+
+<ParamField path="--log-level" type="string" default="info">
+  Logging level for all processes.
+  
+  Available levels:
+  - `critical` - Only critical errors
+  - `error` - Error messages
+  - `warning` - Warnings and errors
+  - `info` - Informational messages (default)
+  - `debug` - Detailed debugging output
+  - `trace` - Verbose trace-level logging (for Rust consumers)
+</ParamField>
+
+## What Gets Started
+
+The devserver starts different services based on configuration and feature flags:
+
+### Core Services (Always)
+
+<CardGroup cols={2}>
+  <Card title="API Server" icon="server">
+    Main HTTP API for query processing
+    
+    **Endpoint**: Default `http://localhost:1218`
+  </Card>
+  
+  <Card title="Admin Interface" icon="shield">
+    Administrative web UI
+    
+    **Endpoint**: Default `http://localhost:1219`
+  </Card>
+</CardGroup>
+
+### Data Processing (When --workers enabled)
+
+<Accordion title="Transaction Processing">
+  - **transaction-consumer** - Processes transaction/span events
+  - Command: `snuba rust-consumer --storage=transactions`
+  - Consumer group: `transactions_group`
+</Accordion>
+
+<Accordion title="Error Processing">
+  - **errors-consumer** - Processes error events
+  - **replacer** - Handles data replacements and updates
+  - Consumer group: `errors_group`
+</Accordion>
+
+<Accordion title="Outcomes Processing">
+  - **outcomes-consumer** - Standard outcomes
+  - **outcomes-billing-consumer** - Billing outcomes from separate topic
+  - Consumer group: `outcomes_group` / `outcomes_billing_group`
+</Accordion>
+
+<Accordion title="Subscriptions">
+  Subscription services for events and transactions:
+  
+  **Combined Mode** (default):
+  - `subscriptions-scheduler-executor-events`
+  - `subscriptions-scheduler-executor-transactions`
+  - `subscriptions-scheduler-executor-eap-items`
+  
+  **Separate Mode** (if configured):
+  - `subscriptions-scheduler-events` + `subscriptions-executor-events`
+  - `subscriptions-scheduler-transactions` + `subscriptions-executor-transactions`
+  - `subscriptions-scheduler-eap-items` + `subscriptions-executor-eap-items`
+</Accordion>
+
+### Optional Services (Feature Flags)
+
+<AccordionGroup>
+  <Accordion title="Metrics (ENABLE_SENTRY_METRICS_DEV)">
+    When enabled, starts consumers for:
+    - **metrics-consumer** - Legacy metrics
+    - **generic-metrics-distributions-consumer**
+    - **generic-metrics-sets-consumer**
+    - **generic-metrics-counters-consumer**
+    - **generic-metrics-gauges-consumer**
+    
+    If `ENABLE_METRICS_SUBSCRIPTIONS` is also enabled:
+    - Subscription schedulers and executors for each metric type
+  </Accordion>
+  
+  <Accordion title="Profiles (ENABLE_PROFILES_CONSUMER)">
+    When enabled, starts:
+    - **profiles** - Profile data consumer
+    - **profile_chunks** - Profile chunks consumer
+    - **functions** - Functions data consumer
+  </Accordion>
+  
+  <Accordion title="Replays (ENABLE_REPLAYS_CONSUMER)">
+    When enabled, starts:
+    - **replays-consumer** - Session replay events
+  </Accordion>
+  
+  <Accordion title="Issues (ENABLE_ISSUE_OCCURRENCE_CONSUMER)">
+    When enabled, starts:
+    - **issue-occurrence-consumer** - Generic issue events
+  </Accordion>
+  
+  <Accordion title="Group Attributes (ENABLE_GROUP_ATTRIBUTES_CONSUMER)">
+    When enabled, starts:
+    - **group-attributes-consumer** - Group attribute updates
+  </Accordion>
+  
+  <Accordion title="Lightweight Deletions (ENABLE_LW_DELETIONS_CONSUMER)">
+    When enabled, starts:
+    - **lw-deletions-consumer** - Processes deletion requests
+  </Accordion>
+  
+  <Accordion title="EAP Items (Always enabled in dev)">
+    - **eap-items-consumer** - Events Analytics Platform items
+    - Uses RowBinary format
+  </Accordion>
+</AccordionGroup>
+
+## Examples
+
+<CodeGroup>
+```bash Full Development Environment
+# Start everything with default settings
+snuba devserver
+```
+
+```bash API Only
+# Start just the API server (no workers)
+snuba devserver --no-workers
+```
+
+```bash Skip Bootstrap
+# Start without re-bootstrapping (faster restart)
+snuba devserver --no-bootstrap
+```
+
+```bash Debug Mode
+# Start with debug logging for troubleshooting
+snuba devserver --log-level debug
+```
+
+```bash Minimal Setup
+# API only, no bootstrap
+snuba devserver --no-workers --no-bootstrap
+```
+</CodeGroup>
+
+## Startup Sequence
+
+When you run `snuba devserver`, the following happens:
+
+<Steps>
+  <Step title="Bootstrap (if enabled)">
+    Runs `snuba bootstrap --force --no-migrate` to create Kafka topics.
+    
+    If this fails and `--workers` is enabled, the command exits immediately.
+  </Step>
+  
+  <Step title="Migrations">
+    Runs `snuba migrations migrate --force` to apply all pending database migrations.
+    
+    If this fails, the command exits immediately.
+  </Step>
+  
+  <Step title="Process Manager Initialization">
+    Honcho manager is initialized with all configured daemons.
+  </Step>
+  
+  <Step title="Service Startup">
+    All services start in parallel with unified logging output.
+  </Step>
+</Steps>
+
+<Note>
+  If `--no-workers` is specified, the bootstrap phase still runs (unless `--no-bootstrap` is also used), but only the API server process is started.
+</Note>
+
+## Default Consumer Configuration
+
+All Rust consumers started by devserver use these common options:
+
+```bash
+--use-rust-processor
+--auto-offset-reset=latest
+--no-strict-offset-reset
+--enforce-schema
+--log-level={specified_level}
+```
+
+This configuration:
+- Uses Rust-based message processing for performance
+- Starts consuming from the latest messages (doesn't replay old data)
+- Allows offset reset even when offsets exist
+- Enforces schema validation on incoming messages
+- Uses the log level specified via `--log-level` option
+
+## Process Management
+
+### Viewing Logs
+
+All process logs are multiplexed to stdout with the process name prefix:
+
+```
+api             | 2026-03-09 10:30:45 [INFO] Starting Snuba API server
+transaction-co  | 2026-03-09 10:30:45 [INFO] Consumer Starting
+errors-consume  | 2026-03-09 10:30:45 [INFO] Consumer Starting
+admin           | 2026-03-09 10:30:45 [INFO] Starting admin interface
+```
+
+### Stopping Services
+
+Press `Ctrl+C` to gracefully stop all services. Honcho will:
+1. Send SIGTERM to all processes
+2. Wait for graceful shutdown
+3. Report exit codes
+
+### Exit Codes
+
+The devserver command exits with:
+- `0` - All services shut down cleanly
+- `>0` - Bootstrap or migration failure, or one or more services crashed
+
+## Configuration
+
+The devserver respects various settings from `snuba/settings.py`:
+
+<AccordionGroup>
+  <Accordion title="Service Endpoints">
+    - `HOST` / `PORT` - API server binding (default: 127.0.0.1:1218)
+    - `ADMIN_HOST` / `ADMIN_PORT` - Admin interface (default: 127.0.0.1:1219)
+  </Accordion>
+  
+  <Accordion title="Feature Flags">
+    - `ENABLE_SENTRY_METRICS_DEV` - Enable metrics consumers
+    - `ENABLE_PROFILES_CONSUMER` - Enable profiling consumers
+    - `ENABLE_REPLAYS_CONSUMER` - Enable replay consumer
+    - `ENABLE_ISSUE_OCCURRENCE_CONSUMER` - Enable issue consumer
+    - `ENABLE_GROUP_ATTRIBUTES_CONSUMER` - Enable group attributes
+    - `ENABLE_LW_DELETIONS_CONSUMER` - Enable lightweight deletions
+    - `ENABLE_METRICS_SUBSCRIPTIONS` - Enable metrics subscriptions
+  </Accordion>
+  
+  <Accordion title="Subscription Mode">
+    - `SEPARATE_SCHEDULER_EXECUTOR_SUBSCRIPTIONS_DEV` - Run scheduler/executor separately
+    - Default: `false` (combined scheduler-executor)
+  </Accordion>
+</AccordionGroup>
+
+## Common Workflows
+
+### First Time Setup
+
+<Steps>
+  <Step title="Initial Bootstrap">
+    Start with full bootstrap:
+    ```bash
+    snuba devserver
+    ```
+    This creates all Kafka topics and runs migrations.
+  </Step>
+  
+  <Step title="Verify Services">
+    Check that services are running:
+    ```bash
+    # Test API
+    curl http://localhost:1218/health
+    
+    # Access Admin UI
+    open http://localhost:1219
+    ```
+  </Step>
+  
+  <Step title="Generate Test Data">
+    Use Sentry's development server or scripts to generate test events.
+  </Step>
+</Steps>
+
+### Daily Development
+
+```bash
+# Quick restart without bootstrap
+snuba devserver --no-bootstrap
+
+# Or API only for testing queries
+snuba devserver --no-workers --no-bootstrap
+```
+
+### Debugging Issues
+
+<CodeGroup>
+```bash Debug Consumers
+# Enable debug logging to see detailed consumer behavior
+snuba devserver --log-level debug
+```
+
+```bash Test Migrations
+# Run migrations manually first
+snuba migrations migrate --force
+
+# Then start without bootstrap
+snuba devserver --no-bootstrap
+```
+
+```bash Isolate API
+# Test API without worker interference
+snuba devserver --no-workers
+```
+</CodeGroup>
+
+### Reset Environment
+
+```bash
+# Stop devserver
+# Ctrl+C
+
+# Clear data (if needed)
+# - Delete ClickHouse tables
+# - Reset Kafka topics
+
+# Fresh bootstrap
+snuba devserver
+```
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Bootstrap Fails">
+    If bootstrap fails to connect to Kafka:
+    
+    1. Check that Kafka is running
+    2. Verify Kafka configuration in settings
+    3. Try with longer timeout:
+       ```bash
+       # Kafka has up to 60 seconds to become available
+       snuba devserver
+       ```
+  </Accordion>
+  
+  <Accordion title="Migration Errors">
+    If migrations fail:
+    
+    ```bash
+    # Check ClickHouse is running
+    clickhouse-client --query "SELECT 1"
+    
+    # View migration status
+    snuba migrations list
+    
+    # Fix any in-progress migrations
+    snuba migrations reverse-in-progress
+    
+    # Retry
+    snuba devserver
+    ```
+  </Accordion>
+  
+  <Accordion title="Consumer Won't Start">
+    If a consumer fails to start:
+    
+    1. Check the specific consumer logs in the output
+    2. Verify storage configuration
+    3. Ensure Kafka topics exist:
+       ```bash
+       snuba bootstrap --force --no-migrate
+       ```
+    4. Check ClickHouse connections:
+       ```bash
+       snuba api --debug  # Will show connection errors
+       ```
+  </Accordion>
+  
+  <Accordion title="Port Already in Use">
+    If ports are already bound:
+    
+    ```bash
+    # Check what's using the port
+    lsof -i :1218
+    lsof -i :1219
+    
+    # Kill the process or change settings.py
+    ```
+  </Accordion>
+  
+  <Accordion title="Out of Memory">
+    If running out of memory with all services:
+    
+    1. Start with fewer services:
+       ```bash
+       snuba devserver --no-workers
+       ```
+    2. Disable optional consumers in settings.py
+    3. Reduce consumer batch sizes in source code
+  </Accordion>
+</AccordionGroup>
+
+## Environment Variables
+
+The devserver sets:
+
+```bash
+PYTHONUNBUFFERED=1  # Ensures logs are immediately visible
+RUST_LOG={log_level}  # Configures Rust consumer logging
+```
+
+You can also set:
+
+```bash
+# Override Kafka bootstrap servers
+export KAFKA_BROKER=kafka:9092
+
+# Configure ClickHouse
+export CLICKHOUSE_HOST=localhost
+
+# Enable specific features
+export ENABLE_SENTRY_METRICS_DEV=1
+
+snuba devserver
+```
+
+## Performance Tips
+
+### Faster Restarts
+
+```bash
+# Skip bootstrap for faster startup
+snuba devserver --no-bootstrap
+
+# Or even faster - API only
+snuba devserver --no-workers --no-bootstrap
+```
+
+### Resource Usage
+
+To reduce resource usage during development:
+
+1. **Disable unnecessary features** in `settings.py`:
+   ```python
+   ENABLE_SENTRY_METRICS_DEV = False
+   ENABLE_PROFILES_CONSUMER = False
+   ENABLE_REPLAYS_CONSUMER = False
+   ```
+
+2. **Start API only** when not testing consumers:
+   ```bash
+   snuba devserver --no-workers
+   ```
+
+3. **Use latest offset** to avoid processing old data:
+   - Already configured in devserver default options
+
+## Integration with Sentry Development
+
+When developing Sentry locally:
+
+1. **Start Sentry's dependencies** (including Kafka, ClickHouse)
+2. **Start Snuba devserver**:
+   ```bash
+   snuba devserver
+   ```
+3. **Start Sentry development server**
+4. **Generate events** through Sentry UI or SDK
+5. **Query data** through Snuba API or Sentry
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Consumer Details" icon="inbox" href="/cli/consumer">
+    Learn about individual consumer options
+  </Card>
+  <Card title="Migrations" icon="database" href="/cli/migrations">
+    Understand migration management
+  </Card>
+  <Card title="Admin Interface" icon="shield" href="/cli/admin">
+    Explore administrative features
+  </Card>
+  <Card title="API Documentation" icon="server" href="/api/overview">
+    Query API reference
+  </Card>
+</CardGroup>

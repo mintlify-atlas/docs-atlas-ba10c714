@@ -1,0 +1,569 @@
+---
+title: "Metrics Dataset"
+description: "Time-series metrics including counters, distributions, sets, and gauges with multi-granularity aggregation"
+---
+
+<Note>
+The metrics dataset stores pre-aggregated time-series data from Sentry, supporting counters, distributions, sets, and gauges. It's designed for high-volume, low-latency aggregation queries.
+</Note>
+
+## Overview
+
+The metrics dataset stores aggregated metrics data with configurable time granularities. Unlike events and transactions which store individual occurrences, metrics store pre-aggregated summaries optimized for time-series analysis.
+
+### Key Characteristics
+
+- **Storage**: Multiple storages per metric type (counters, distributions, sets, gauges)
+- **Entities**: Separate entities for each metric type and aggregation level
+- **Partitioning**: By time bucket and granularity
+- **Primary Use Cases**: Dashboards, alerting, release health, custom metrics
+
+## Metric Types
+
+Snuba supports four metric types:
+
+<CardGroup cols={2}>
+  <Card title="Counters" icon="plus">
+    Cumulative values that increment over time (e.g., request counts, error counts)
+  </Card>
+  <Card title="Distributions" icon="chart-histogram">
+    Histograms of values for percentile calculations (e.g., response times)
+  </Card>
+  <Card title="Sets" icon="layer-group">
+    Unique value counts using HyperLogLog (e.g., unique users)
+  </Card>
+  <Card title="Gauges" icon="gauge">
+    Point-in-time measurements (e.g., memory usage, CPU percentage)
+  </Card>
+</CardGroup>
+
+## Dataset Structure
+
+The metrics dataset includes multiple entities:
+
+```yaml
+entities:
+  - metrics_counters
+  - metrics_distributions
+  - metrics_sets
+  - org_metrics_counters
+```
+
+Each entity type queries a specific metric aggregation.
+
+## Entity: metrics_counters
+
+Counters store cumulative sum aggregations.
+
+### Schema
+
+```yaml
+org_id: UInt64             # Organization ID
+project_id: UInt64         # Project ID (required)
+metric_id: UInt64          # Hashed metric name
+timestamp: DateTime        # Time bucket (required)
+bucketed_time: DateTime    # Alias for timestamp
+granularity: UInt32        # Time granularity in seconds
+use_case_id: String        # Use case identifier
+tags: Nested(
+  key: UInt64,             # Tag key hash
+  value: UInt64            # Tag value hash
+)
+value: AggregateFunction(sum, Float64)  # Aggregated counter value
+```
+
+### Time Granularities
+
+Metrics support multiple granularities:
+
+- **10 seconds** - High-resolution real-time data
+- **60 seconds** - Standard resolution
+- **3600 seconds (1 hour)** - Medium aggregation
+- **86400 seconds (1 day)** - Long-term trends
+
+<Note>
+Queries must specify a minimum granularity. The GranularityValidator enforces a minimum of 10 seconds for counters.
+</Note>
+
+### Storage Configuration
+
+Counters use materialized views for different granularities:
+
+```yaml
+storage:
+  key: metrics_counters
+  set_key: metrics
+local_table_name: metrics_counters_v2_local
+dist_table_name: metrics_counters_v2_dist
+```
+
+### Aggregate Function
+
+The value column uses ClickHouse's AggregateFunction type:
+
+```sql
+value AggregateFunction(sum, Float64)
+```
+
+This stores pre-aggregated state that can be merged efficiently. In queries, use `sumMerge(value)` to extract the final value:
+
+```sql
+SELECT 
+  metric_id,
+  sumMerge(value) as total
+FROM metrics_counters_v2_local
+GROUP BY metric_id
+```
+
+## Entity: metrics_distributions
+
+Distributions store histograms for percentile calculations.
+
+### Schema
+
+```yaml
+org_id: UInt64
+project_id: UInt64
+metric_id: UInt64
+timestamp: DateTime
+granularity: UInt32
+use_case_id: String
+tags: Nested(
+  key: UInt64,
+  value: UInt64
+)
+values: Array(Float64)              # Raw distribution values
+percentiles: Array(Float64)         # Pre-calculated percentiles
+min: Float64                        # Minimum value
+max: Float64                        # Maximum value
+avg: Float64                        # Average value
+sum: Float64                        # Sum of values
+count: UInt64                       # Number of values
+```
+
+### Percentile Calculations
+
+Distributions support quantile functions:
+
+```sql
+MATCH (metrics_distributions)
+SELECT 
+  metric_id,
+  quantile(0.5)(percentiles) as p50,
+  quantile(0.95)(percentiles) as p95,
+  quantile(0.99)(percentiles) as p99
+WHERE project_id = 1
+  AND timestamp >= toDateTime('2024-01-01 00:00:00')
+  AND timestamp < toDateTime('2024-01-02 00:00:00')
+GROUP BY metric_id
+```
+
+## Entity: metrics_sets
+
+Sets track unique values using HyperLogLog.
+
+### Schema
+
+```yaml
+org_id: UInt64
+project_id: UInt64
+metric_id: UInt64
+timestamp: DateTime
+granularity: UInt32
+use_case_id: String
+tags: Nested(
+  key: UInt64,
+  value: UInt64
+)
+value: AggregateFunction(uniq, UInt64)  # HyperLogLog aggregate
+```
+
+### Unique Count Queries
+
+```sql
+MATCH (metrics_sets)
+SELECT 
+  metric_id,
+  uniqMerge(value) as unique_count
+WHERE project_id = 1
+  AND timestamp >= toDateTime('2024-01-01 00:00:00')
+  AND timestamp < toDateTime('2024-01-02 00:00:00')
+GROUP BY metric_id
+```
+
+## Tag System
+
+Metrics use integer tag keys and values for efficiency:
+
+### Tag Hashing
+
+Tag keys and values are hashed to UInt64:
+
+```python
+# Tag: {"environment": "production"}
+# Becomes:
+tag_key = hash("environment")    # UInt64
+tag_value = hash("production")   # UInt64
+```
+
+### Querying Tags
+
+Use tag subscripts in queries:
+
+```sql
+MATCH (metrics_counters)
+SELECT 
+  sumMerge(value) as total
+WHERE project_id = 1
+  AND timestamp >= toDateTime('2024-01-01 00:00:00')
+  AND timestamp < toDateTime('2024-01-02 00:00:00')
+  AND tags[12345] = 67890  -- environment = production (hashed)
+```
+
+### Tag Resolution
+
+Tag string-to-hash mapping is maintained separately and resolved by the Sentry application layer before querying Snuba.
+
+## Storage Selector
+
+Metrics entities use storage selectors to choose between raw and aggregated tables:
+
+```yaml
+storage_selector:
+  selector: SimpleQueryStorageSelector
+  args:
+    storage: metrics_counters
+```
+
+The selector routes queries to the appropriate granularity table based on the requested time range and granularity.
+
+## Query Processors
+
+### Granularity Processor
+
+```yaml
+- processor: GranularityProcessor
+```
+
+Determines the appropriate granularity for the query based on time range.
+
+### Time Series Processor
+
+```yaml
+- processor: TimeSeriesProcessor
+  args:
+    time_group_columns:
+      bucketed_time: timestamp
+    time_parse_columns:
+      - timestamp
+```
+
+Handles time-based grouping and bucketing.
+
+### Tags Type Transformer
+
+```yaml
+- processor: TagsTypeTransformer
+```
+
+Transforms tag queries to work with integer-based tag storage.
+
+## Function Mapping
+
+Metrics entities map function names for aggregate functions:
+
+```yaml
+translation_mappers:
+  functions:
+    - mapper: FunctionNameMapper
+      args:
+        from_name: sum
+        to_name: sumMerge
+    - mapper: FunctionNameMapper
+      args:
+        from_name: sumIf
+        to_name: sumMergeIf
+```
+
+This ensures `sum(value)` in queries becomes `sumMerge(value)` for AggregateFunction columns.
+
+## Validators
+
+### Required Columns
+
+```yaml
+validators:
+  - validator: EntityRequiredColumnValidator
+    args:
+      required_filter_columns:
+        - org_id
+        - project_id
+```
+
+Both org_id and project_id are required for all metrics queries.
+
+### Granularity Validator
+
+```yaml
+  - validator: GranularityValidator
+    args:
+      minimum: 10
+```
+
+Enforces minimum 10-second granularity.
+
+## Data Ingestion
+
+### Stream Loader
+
+Metrics are ingested through specialized processors:
+
+```yaml
+stream_loader:
+  processor: GenericMetricsProcessor
+  default_topic: generic-metrics
+  commit_log_topic: snuba-metrics-commit-log
+```
+
+### Message Format
+
+Metrics messages contain pre-aggregated data:
+
+```json
+{
+  "org_id": 1,
+  "project_id": 2,
+  "metric_id": 12345,
+  "timestamp": 1647532800,
+  "tags": {
+    "67890": 11111,  // environment: production
+    "22222": 33333   // release: 1.0.0
+  },
+  "type": "c",  // counter
+  "value": 42.0,
+  "retention_days": 90
+}
+```
+
+### Metric Types in Messages
+
+- `"c"` - Counter
+- `"d"` - Distribution
+- `"s"` - Set
+- `"g"` - Gauge
+
+## Example Queries
+
+### Counter: Total requests
+
+```sql
+MATCH (metrics_counters)
+SELECT 
+  toStartOfHour(timestamp) as hour,
+  sumMerge(value) as total_requests
+WHERE org_id = 1
+  AND project_id = 2
+  AND metric_id = 12345  -- requests.count
+  AND timestamp >= toDateTime('2024-01-01 00:00:00')
+  AND timestamp < toDateTime('2024-01-02 00:00:00')
+  AND granularity = 60
+GROUP BY hour
+ORDER BY hour
+```
+
+### Distribution: Response time percentiles
+
+```sql
+MATCH (metrics_distributions)
+SELECT 
+  quantile(0.5)(percentiles) as p50,
+  quantile(0.95)(percentiles) as p95,
+  quantile(0.99)(percentiles) as p99,
+  avg(avg) as average
+WHERE org_id = 1
+  AND project_id = 2
+  AND metric_id = 67890  -- transaction.duration
+  AND timestamp >= toDateTime('2024-01-01 00:00:00')
+  AND timestamp < toDateTime('2024-01-02 00:00:00')
+  AND granularity = 60
+```
+
+### Set: Unique users
+
+```sql
+MATCH (metrics_sets)
+SELECT 
+  toStartOfDay(timestamp) as day,
+  uniqMerge(value) as unique_users
+WHERE org_id = 1
+  AND project_id = 2
+  AND metric_id = 11111  -- users.unique
+  AND timestamp >= toDateTime('2024-01-01 00:00:00')
+  AND timestamp < toDateTime('2024-01-08 00:00:00')
+  AND granularity = 3600
+GROUP BY day
+ORDER BY day
+```
+
+### Counter with tag filtering
+
+```sql
+MATCH (metrics_counters)
+SELECT 
+  sumMerge(value) as error_count
+WHERE org_id = 1
+  AND project_id = 2
+  AND metric_id = 22222  -- errors.count
+  AND timestamp >= toDateTime('2024-01-01 00:00:00')
+  AND timestamp < toDateTime('2024-01-02 00:00:00')
+  AND tags[33333] = 44444  -- environment = production
+  AND granularity = 60
+```
+
+### Counter rate calculation
+
+```sql
+MATCH (metrics_counters)
+SELECT 
+  toStartOfMinute(timestamp) as minute,
+  sumMerge(value) / 60 as rate_per_second
+WHERE org_id = 1
+  AND project_id = 2
+  AND metric_id = 55555
+  AND timestamp >= toDateTime('2024-01-01 12:00:00')
+  AND timestamp < toDateTime('2024-01-01 13:00:00')
+  AND granularity = 10
+GROUP BY minute
+ORDER BY minute
+```
+
+## Organization-Level Metrics
+
+The `org_metrics_counters` entity provides organization-wide aggregations:
+
+```yaml
+entity: org_metrics_counters
+# Similar schema but optimized for org-level queries
+# May have different retention and granularity options
+```
+
+Use this for cross-project metrics and organization-wide dashboards.
+
+## Subscriptions
+
+Metrics support subscriptions for alerting:
+
+```yaml
+subscription_validators:
+  - validator: AggregationValidator
+    args:
+      max_allowed_aggregations: 3
+      disallowed_aggregations:
+        - having
+        - orderby
+      required_time_column: timestamp
+```
+
+Subscriptions can use up to 3 aggregations but cannot use HAVING or ORDER BY.
+
+## Use Cases
+
+<AccordionGroup>
+  <Accordion title="Release Health">
+    Track crash rates, session counts, and user adoption using counters and sets.
+    
+    ```sql
+    -- Crash-free rate
+    SELECT 
+      (1 - sumMerge(crashes) / sumMerge(sessions)) * 100 as crash_free_rate
+    ```
+  </Accordion>
+  
+  <Accordion title="Custom Dashboards">
+    Build custom metrics dashboards with business KPIs using all metric types.
+    
+    ```sql
+    -- Business metrics dashboard
+    SELECT 
+      sumMerge(revenue) as total_revenue,
+      uniqMerge(customers) as unique_customers,
+      quantile(0.95)(checkout_time) as p95_checkout
+    ```
+  </Accordion>
+  
+  <Accordion title="Performance Monitoring">
+    Track application performance with distributions for latency percentiles.
+    
+    ```sql
+    -- API endpoint performance
+    SELECT 
+      endpoint,
+      quantile(0.5)(duration) as median,
+      quantile(0.99)(duration) as p99
+    GROUP BY endpoint
+    ```
+  </Accordion>
+  
+  <Accordion title="Capacity Planning">
+    Use gauges to track resource utilization over time.
+    
+    ```sql
+    -- Memory usage trends
+    SELECT 
+      toStartOfHour(timestamp) as hour,
+      avg(memory_usage) as avg_memory,
+      max(memory_usage) as peak_memory
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Performance Considerations
+
+<AccordionGroup>
+  <Accordion title="Always specify org_id and project_id">
+    Both are required filters and critical for query performance and data isolation.
+  </Accordion>
+  
+  <Accordion title="Choose appropriate granularity">
+    Higher granularity (smaller time buckets) means more data to scan. Use the coarsest granularity that meets your needs.
+  </Accordion>
+  
+  <Accordion title="Limit time ranges">
+    Keep time ranges reasonable (< 90 days for fine granularity, longer for coarse granularity).
+  </Accordion>
+  
+  <Accordion title="Use metric_id filters">
+    Always filter by metric_id when querying specific metrics to avoid full table scans.
+  </Accordion>
+  
+  <Accordion title="Tag filtering is efficient">
+    Integer-based tags are highly optimized. Use tag filters to reduce data scanned.
+  </Accordion>
+</AccordionGroup>
+
+## Generic Metrics
+
+Snuba also supports a "generic_metrics" dataset with additional features:
+
+- Meta tables for tag exploration
+- Bucket-level aggregations
+- Tag value enumeration
+
+See the generic_metrics configuration for advanced use cases.
+
+## Related Resources
+
+<CardGroup cols={2}>
+  <Card title="MQL Reference" icon="chart-line" href="/query/mql">
+    Learn about Metrics Query Language
+  </Card>
+  <Card title="Subscriptions" icon="bell" href="/api/subscriptions">
+    Set up metric-based alerts
+  </Card>
+  <Card title="Generic Metrics" icon="gauge" href="/datasets/metrics">
+    Advanced metrics with meta tables
+  </Card>
+  <Card title="Query Optimization" icon="gauge-high" href="/query/optimization">
+    Optimize metrics queries
+  </Card>
+</CardGroup>

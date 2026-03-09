@@ -1,0 +1,541 @@
+---
+title: "Replays Dataset"
+description: "Session replay data with user interactions, browser events, and debugging context"
+---
+
+<Note>
+The replays dataset stores session replay data from Sentry, capturing user interactions, browser events, and application state for debugging purposes. It enables developers to replay user sessions and understand issues in context.
+</Note>
+
+## Overview
+
+The replays dataset captures rich session data including user interactions, DOM mutations, console logs, network requests, and errors. Each replay represents a recorded user session that can be played back for debugging.
+
+### Key Characteristics
+
+- **Storage**: Primary `replays` storage with aggregated view
+- **Entity**: `replays` entity
+- **Partitioning**: By retention_days and date
+- **Primary Use Cases**: Bug reproduction, user journey analysis, rage click detection
+
+## Entity: replays
+
+The replays entity provides the query interface for session replay data.
+
+### Core Columns
+
+#### Identification
+
+```yaml
+replay_id: UUID            # Unique replay identifier
+project_id: UInt64         # Project identifier (required)
+event_hash: UUID           # Hash of replay event
+segment_id: UInt16         # Segment number within replay
+```
+
+<Note>
+Replays are split into segments for efficient storage and streaming. A single replay may consist of multiple segments.
+</Note>
+
+#### Timestamps
+
+```yaml
+timestamp: DateTime         # When the segment was received (required)
+time: DateTime              # Alias for timestamp
+replay_start_timestamp: DateTime  # When the replay session started
+```
+
+#### Replay Metadata
+
+```yaml
+replay_type: String         # Type of replay (session, error, custom)
+error_sample_rate: Float64  # Error sampling rate
+session_sample_rate: Float64 # Session sampling rate
+title: String               # Page title (readonly)
+url: String                 # Current page URL
+urls: Array(String)         # All URLs visited in replay
+count_urls: UInt16          # Number of unique URLs
+```
+
+### Error Context
+
+```yaml
+error_ids: Array(UUID)      # Associated error event IDs
+_error_ids_hashed: Array(UInt64)  # Hashed error IDs
+count_errors: UInt16        # Total error count
+fatal_id: UUID              # First fatal error ID
+error_id: UUID              # First error ID
+warning_id: UUID            # First warning ID
+info_id: UUID               # First info ID
+debug_id: UUID              # First debug ID
+count_error_events: UInt8   # Count of error-level events
+count_warning_events: UInt8 # Count of warning-level events
+count_info_events: UInt8    # Count of info-level events
+```
+
+### User Context
+
+```yaml
+user: String                # User identifier
+user_id: String             # User ID
+user_name: String           # Username
+user_email: String          # User email
+ip_address_v4: IPv4         # Client IPv4 address
+ip_address_v6: IPv6         # Client IPv6 address
+```
+
+### Geographic Context
+
+```yaml
+user_geo_country_code: String  # Country code (e.g., US)
+user_geo_region: String        # Region/state
+user_geo_city: String          # City name
+user_geo_subdivision: String   # Geographic subdivision
+```
+
+### Platform Context
+
+```yaml
+platform: String            # Platform (javascript, etc.)
+environment: String         # Environment name
+release: String             # Release version
+dist: String                # Distribution identifier
+```
+
+### Device & Browser
+
+```yaml
+os_name: String             # Operating system name
+os_version: String          # OS version
+browser_name: String        # Browser name (Chrome, Firefox, etc.)
+browser_version: String     # Browser version
+device_name: String         # Device name
+device_brand: String        # Device brand
+device_family: String       # Device family
+device_model: String        # Device model
+```
+
+### SDK Information
+
+```yaml
+sdk_name: String            # SDK name (sentry.javascript.browser, etc.)
+sdk_version: String         # SDK version
+```
+
+### Click & Interaction Tracking
+
+#### Web Clicks
+
+```yaml
+click_node_id: UInt32       # DOM node ID
+click_tag: String           # HTML tag name
+click_id: String            # Element ID attribute
+click_class: Array(String)  # CSS classes
+click_text: String          # Element text content
+click_role: String          # ARIA role
+click_alt: String           # Alt text
+click_testid: String        # Test ID attribute
+click_aria_label: String    # ARIA label
+click_title: String         # Title attribute
+click_component_name: String # React/Vue component name
+click_is_dead: UInt8        # Dead click indicator (0 or 1)
+click_is_rage: UInt8        # Rage click indicator (0 or 1)
+```
+
+<Note>
+**Dead clicks** are clicks that don't trigger any visible response. **Rage clicks** are rapid repeated clicks on the same element, often indicating user frustration.
+</Note>
+
+#### Mobile Taps
+
+```yaml
+tap_message: String         # Tap event message
+tap_view_class: String      # View class name
+tap_view_id: String         # View identifier
+```
+
+### Distributed Tracing
+
+```yaml
+trace_ids: Array(UUID)      # Associated trace IDs
+```
+
+### Tags
+
+```yaml
+tags: Nested(
+  key: String,
+  value: String
+)
+_tags_hash_map: Array(UInt64)  # Optimization for tag lookups
+```
+
+### OTA Updates (Mobile)
+
+```yaml
+ota_updates_channel: String         # Update channel
+ota_updates_runtime_version: String # Runtime version
+ota_updates_update_id: String       # Update ID
+```
+
+### Management
+
+```yaml
+is_archived: UInt8          # Archive status (0 or 1)
+viewed_by_id: UInt64        # User ID who viewed the replay
+retention_days: UInt16      # Data retention period
+```
+
+### Processing Metadata
+
+```yaml
+partition: UInt16           # Kafka partition
+offset: UInt64              # Kafka offset
+```
+
+## Storage: replays
+
+The primary writable storage for replay data.
+
+### Table Structure
+
+```sql
+CREATE TABLE replays_local (
+    replay_id UUID,
+    project_id UInt64,
+    timestamp DateTime,
+    segment_id UInt16,
+    -- ... other columns
+) ENGINE = MergeTree()
+PARTITION BY (retention_days, toMonday(timestamp))
+ORDER BY (project_id, toStartOfDay(timestamp), replay_id)
+```
+
+### Storage Configuration
+
+```yaml
+storage:
+  key: replays
+  set_key: replays
+readiness_state: complete
+local_table_name: replays_local
+dist_table_name: replays_dist
+partition_format:
+  - retention_days
+  - date
+```
+
+## Query Processors
+
+Replays storage applies processors for optimization:
+
+### Basic Functions
+
+```yaml
+- processor: BasicFunctionsProcessor
+```
+
+Handles standard SQL functions.
+
+### Time Series Processing
+
+```yaml
+- processor: TimeSeriesProcessor
+  args:
+    time_group_columns:
+      time: timestamp
+    time_parse_columns:
+      - timestamp
+```
+
+## Data Ingestion
+
+### Stream Loader
+
+```yaml
+stream_loader:
+  processor: ReplaysProcessor
+  default_topic: replays
+  commit_log_topic: snuba-replays-commit-log
+```
+
+### Message Format
+
+Replay segments are ingested from Kafka:
+
+```json
+{
+  "type": "replay_event",
+  "replay_id": "abc123...",
+  "segment_id": 0,
+  "project_id": 1,
+  "timestamp": 1647532800,
+  "replay_start_timestamp": 1647532750,
+  "urls": ["https://example.com/page1", "https://example.com/page2"],
+  "error_ids": ["error-uuid-1", "error-uuid-2"],
+  "trace_ids": ["trace-uuid-1"],
+  "platform": "javascript",
+  "environment": "production",
+  "release": "1.0.0",
+  "user": {
+    "id": "user-123",
+    "email": "user@example.com"
+  },
+  "browser": {
+    "name": "Chrome",
+    "version": "120.0.0"
+  },
+  "tags": {
+    "custom_tag": "value"
+  },
+  "clicks": [
+    {
+      "node_id": 42,
+      "tag": "button",
+      "text": "Submit",
+      "is_rage": 0
+    }
+  ]
+}
+```
+
+## Example Queries
+
+### Find replays with errors
+
+```sql
+MATCH (replays)
+SELECT replay_id, url, count_errors, error_ids
+WHERE project_id = 1
+  AND timestamp >= toDateTime('2024-01-01 00:00:00')
+  AND timestamp < toDateTime('2024-01-02 00:00:00')
+  AND count_errors > 0
+ORDER BY count_errors DESC
+LIMIT 100
+```
+
+### Find rage clicks
+
+```sql
+MATCH (replays)
+SELECT 
+  replay_id,
+  url,
+  click_tag,
+  click_text,
+  click_component_name
+WHERE project_id = 1
+  AND timestamp >= toDateTime('2024-01-01 00:00:00')
+  AND timestamp < toDateTime('2024-01-02 00:00:00')
+  AND click_is_rage = 1
+ORDER BY timestamp DESC
+LIMIT 50
+```
+
+### Analyze user journey
+
+```sql
+MATCH (replays)
+SELECT 
+  replay_id,
+  replay_start_timestamp,
+  urls,
+  count_urls,
+  arrayJoin(error_ids) as error_id
+WHERE project_id = 1
+  AND timestamp >= toDateTime('2024-01-01 00:00:00')
+  AND timestamp < toDateTime('2024-01-02 00:00:00')
+  AND user_id = 'user-123'
+ORDER BY replay_start_timestamp
+```
+
+### Browser breakdown
+
+```sql
+MATCH (replays)
+SELECT 
+  browser_name,
+  browser_version,
+  count() as replay_count,
+  sum(count_errors) as total_errors
+WHERE project_id = 1
+  AND timestamp >= toDateTime('2024-01-01 00:00:00')
+  AND timestamp < toDateTime('2024-01-02 00:00:00')
+GROUP BY browser_name, browser_version
+ORDER BY replay_count DESC
+```
+
+### Dead click analysis
+
+```sql
+MATCH (replays)
+SELECT 
+  click_tag,
+  click_text,
+  click_component_name,
+  count() as dead_click_count
+WHERE project_id = 1
+  AND timestamp >= toDateTime('2024-01-01 00:00:00')
+  AND timestamp < toDateTime('2024-01-02 00:00:00')
+  AND click_is_dead = 1
+GROUP BY click_tag, click_text, click_component_name
+ORDER BY dead_click_count DESC
+LIMIT 20
+```
+
+### Replays by release
+
+```sql
+MATCH (replays)
+SELECT 
+  release,
+  count(DISTINCT replay_id) as replay_count,
+  sum(count_errors) as error_count,
+  sum(click_is_rage) as rage_clicks
+WHERE project_id = 1
+  AND timestamp >= toDateTime('2024-01-01 00:00:00')
+  AND timestamp < toDateTime('2024-01-02 00:00:00')
+GROUP BY release
+ORDER BY replay_count DESC
+```
+
+### Geographic distribution
+
+```sql
+MATCH (replays)
+SELECT 
+  user_geo_country_code,
+  user_geo_city,
+  count(DISTINCT replay_id) as replays,
+  count(DISTINCT user_id) as unique_users
+WHERE project_id = 1
+  AND timestamp >= toDateTime('2024-01-01 00:00:00')
+  AND timestamp < toDateTime('2024-01-02 00:00:00')
+GROUP BY user_geo_country_code, user_geo_city
+ORDER BY replays DESC
+LIMIT 50
+```
+
+## Integration with Other Datasets
+
+### Linking to Events
+
+Replays are linked to errors via `error_ids`:
+
+```sql
+-- Find replay for a specific error
+SELECT replay_id, url, replay_start_timestamp
+FROM replays
+WHERE project_id = 1
+  AND has(error_ids, 'specific-error-uuid')
+ORDER BY timestamp DESC
+LIMIT 1
+```
+
+### Linking to Transactions
+
+Replays link to transactions via `trace_ids`:
+
+```sql
+-- Find replays for slow transactions
+WITH slow_traces AS (
+  SELECT trace_id
+  FROM transactions
+  WHERE project_id = 1
+    AND duration > 5000
+    AND finish_ts >= toDateTime('2024-01-01 00:00:00')
+)
+SELECT r.replay_id, r.url, r.browser_name
+FROM replays r
+WHERE r.project_id = 1
+  AND arrayExists(t -> t IN (SELECT trace_id FROM slow_traces), r.trace_ids)
+```
+
+## Use Cases
+
+<AccordionGroup>
+  <Accordion title="Bug Reproduction">
+    Watch the exact user session where a bug occurred.
+    
+    Query replays with specific error_ids to find the replay showing the bug, then play back the session to see what led to the error.
+  </Accordion>
+  
+  <Accordion title="Rage Click Detection">
+    Identify UI elements causing user frustration.
+    
+    Find replays with click_is_rage = 1 to discover buttons or elements that aren't responding as expected.
+  </Accordion>
+  
+  <Accordion title="User Journey Analysis">
+    Understand how users navigate your application.
+    
+    Query the urls array to see the full navigation path and identify where users drop off or encounter issues.
+  </Accordion>
+  
+  <Accordion title="Dead Click Investigation">
+    Find non-responsive UI elements.
+    
+    Query click_is_dead to discover elements that users click but don't provide feedback, indicating potential UX issues.
+  </Accordion>
+  
+  <Accordion title="Browser-Specific Issues">
+    Isolate problems affecting specific browsers.
+    
+    Group by browser_name and browser_version to find browser-specific bugs with replay examples.
+  </Accordion>
+</AccordionGroup>
+
+## Performance Considerations
+
+<AccordionGroup>
+  <Accordion title="Always filter by project_id">
+    Required for all queries and critical for performance.
+  </Accordion>
+  
+  <Accordion title="Use reasonable time ranges">
+    Replay data can be large. Limit queries to < 30 days for best performance.
+  </Accordion>
+  
+  <Accordion title="Filter by replay_id for specific replays">
+    When looking up a specific replay, include replay_id in WHERE clause.
+  </Accordion>
+  
+  <Accordion title="Be careful with array operations">
+    Operations on arrays (error_ids, urls, trace_ids) can be expensive. Add additional filters when possible.
+  </Accordion>
+  
+  <Accordion title="Use DISTINCT carefully">
+    COUNT(DISTINCT replay_id) can be expensive. Consider using uniq() for approximate counts.
+  </Accordion>
+</AccordionGroup>
+
+## Privacy Considerations
+
+Replays capture user interactions, so privacy is critical:
+
+<Note>
+The Sentry SDK automatically masks sensitive data like passwords, credit card numbers, and personal information before sending replays. Additional privacy controls can be configured in the SDK.
+</Note>
+
+- **Masking**: Text inputs and sensitive elements are masked by default
+- **Blocking**: Specific elements can be blocked from recording
+- **User consent**: Respect user privacy preferences
+- **Data retention**: Configure appropriate retention_days
+- **PII scrubbing**: Additional PII can be scrubbed server-side
+
+## Related Resources
+
+<CardGroup cols={2}>
+  <Card title="Events Dataset" icon="bug" href="/datasets/events">
+    Error data linked via error_ids
+  </Card>
+  <Card title="Transactions Dataset" icon="gauge-high" href="/datasets/transactions">
+    Performance data linked via trace_ids
+  </Card>
+  <Card title="Session Replay Docs" icon="book" href="https://docs.sentry.io/platforms/javascript/session-replay/">
+    SDK integration guide for session replay
+  </Card>
+  <Card title="Query Optimization" icon="gauge-high" href="/query/optimization">
+    Optimize replay queries
+  </Card>
+</CardGroup>

@@ -1,0 +1,543 @@
+---
+title: "Admin Interface"
+description: "Run Snuba's administrative web interface for system management and monitoring"
+---
+
+## Overview
+
+The `admin` command starts Snuba's administrative web interface, providing a web-based UI for managing and monitoring the Snuba system. The admin interface offers tools for query debugging, system status monitoring, and configuration management.
+
+```bash
+snuba admin [OPTIONS]
+```
+
+## Options
+
+<ParamField path="--debug" type="flag">
+  Enable debug mode with auto-reload and detailed error pages.
+  
+  When enabled:
+  - Automatic code reloading on file changes
+  - Interactive debugger on errors
+  - Detailed stack traces in browser
+  - HTTP/1.1 protocol support
+  
+  **Important**: In debug mode, `--processes` and `--threads` must be 1.
+</ParamField>
+
+<ParamField path="--log-level" type="string">
+  Logging level to use for the admin interface.
+  
+  Available levels:
+  - `critical` - Only critical errors
+  - `error` - Error messages
+  - `warning` - Warnings and errors
+  - `info` - Informational messages
+  - `debug` - Detailed debugging information
+</ParamField>
+
+<ParamField path="--processes" type="integer" default="1">
+  Number of worker processes to spawn (minimum: 1).
+  
+  - Single process: Good for development or low-traffic deployments
+  - Multiple processes: Better for production with concurrent requests
+  
+  Must be 1 when `--debug` is enabled.
+</ParamField>
+
+<ParamField path="--threads" type="integer">
+  Number of threads per worker process (minimum: 1).
+  
+  Threads within each process handle concurrent requests:
+  - Single thread: Serialized request handling
+  - Multiple threads: Concurrent request processing within the process
+  
+  Must be 1 when `--debug` is enabled.
+</ParamField>
+
+<ParamField path="--backlog" type="integer" default="128">
+  TCP socket connection backlog size (minimum: 128).
+  
+  Defines how many connections can queue waiting for acceptance:
+  - Lower values: Clients may see connection refused during load spikes
+  - Higher values: More connections can queue (more memory usage)
+  
+  Default of 128 is suitable for most deployments.
+</ParamField>
+
+## Configuration
+
+The admin interface uses settings from `snuba/settings.py`:
+
+```python
+# Default admin interface settings
+ADMIN_HOST = "127.0.0.1"
+ADMIN_PORT = 1219
+```
+
+These can be overridden via environment variables:
+
+```bash
+export ADMIN_HOST=0.0.0.0
+export ADMIN_PORT=8080
+snuba admin
+```
+
+## Examples
+
+<CodeGroup>
+```bash Development Mode
+# Start in debug mode with auto-reload
+snuba admin --debug --log-level debug
+```
+
+```bash Production Mode
+# Run with multiple workers and threads
+snuba admin --processes 4 --threads 8 --log-level info
+```
+
+```bash Custom Configuration
+# Adjust backlog for high-traffic deployment
+snuba admin --processes 8 --threads 4 --backlog 512
+```
+
+```bash Minimal Setup
+# Single process for low-traffic admin interface
+snuba admin --processes 1 --threads 1
+```
+</CodeGroup>
+
+## Accessing the Admin Interface
+
+Once started, the admin interface is available at:
+
+```
+http://<ADMIN_HOST>:<ADMIN_PORT>/
+```
+
+Default: `http://127.0.0.1:1219/`
+
+### Available Features
+
+The admin interface typically provides:
+
+<CardGroup cols={2}>
+  <Card title="Query Tool" icon="magnifying-glass">
+    Test and debug SnQL queries interactively with formatted results
+  </Card>
+  
+  <Card title="System Status" icon="chart-line">
+    Monitor system health, cluster status, and resource usage
+  </Card>
+  
+  <Card title="Config Viewer" icon="gear">
+    View current configuration and storage definitions
+  </Card>
+  
+  <Card title="Tracing Tools" icon="bug">
+    Debug query execution and performance issues
+  </Card>
+</CardGroup>
+
+## Deployment Modes
+
+### Development Mode
+
+For local development with hot-reloading:
+
+```bash
+snuba admin --debug
+```
+
+<Note>
+  In debug mode, the admin interface runs using Werkzeug's development server with:
+  - Single-threaded operation
+  - Auto-reload on code changes
+  - Interactive debugger
+  - HTTP/1.1 support
+</Note>
+
+**Access**: `http://127.0.0.1:1219/`
+
+### Production Mode
+
+For production deployments:
+
+```bash
+snuba admin --processes 4 --threads 8 --backlog 256
+```
+
+This configuration:
+- Runs using uWSGI for better performance
+- Handles concurrent requests efficiently
+- Suitable for production traffic
+- No auto-reload (restart required for code changes)
+
+<Warning>
+  Never use `--debug` mode in production. It exposes sensitive debugging information and has poor performance characteristics.
+</Warning>
+
+## Process Configuration
+
+### Choosing Process Count
+
+<Tabs>
+  <Tab title="Single Process">
+    ```bash
+    snuba admin --processes 1
+    ```
+    
+    **Use when**:
+    - Development environment
+    - Low traffic (< 10 requests/minute)
+    - Running on limited resources
+    - Debugging issues
+    
+    **Advantages**:
+    - Simple debugging
+    - Lower memory usage
+    - Easier to reason about
+    
+    **Disadvantages**:
+    - Limited concurrency
+    - Single point of failure
+  </Tab>
+  
+  <Tab title="Multiple Processes">
+    ```bash
+    snuba admin --processes 4 --threads 8
+    ```
+    
+    **Use when**:
+    - Production environment
+    - Multiple concurrent users
+    - Need for high availability
+    - Multi-core system
+    
+    **Advantages**:
+    - Better concurrency
+    - Fault isolation
+    - Utilizes multiple cores
+    
+    **Disadvantages**:
+    - Higher memory usage
+    - More complex debugging
+  </Tab>
+</Tabs>
+
+### Calculating Workers
+
+A common formula:
+
+```
+Processes = (2 × CPU_cores) + 1
+Threads = 2 to 4
+```
+
+Example for 4-core system:
+```bash
+snuba admin --processes 9 --threads 4
+```
+
+## Performance Tuning
+
+### Low-Traffic Deployment
+
+```bash
+# Minimal resource usage
+snuba admin --processes 1 --threads 4 --backlog 128
+```
+
+### Medium-Traffic Deployment
+
+```bash
+# Balanced configuration
+snuba admin --processes 4 --threads 8 --backlog 256
+```
+
+### High-Traffic Deployment
+
+```bash
+# Maximum throughput
+snuba admin --processes 8 --threads 8 --backlog 512
+```
+
+## Monitoring
+
+### Health Check
+
+While the admin interface doesn't expose a dedicated health endpoint, you can check if it's running:
+
+```bash
+curl http://127.0.0.1:1219/
+```
+
+A successful response indicates the service is healthy.
+
+### Logs
+
+Use appropriate log levels for monitoring:
+
+<CodeGroup>
+```bash Production Logging
+# Minimal logging for production
+snuba admin --log-level warning
+```
+
+```bash Standard Logging
+# Informational logging (default)
+snuba admin --log-level info
+```
+
+```bash Debug Logging
+# Detailed logging for troubleshooting
+snuba admin --log-level debug
+```
+</CodeGroup>
+
+### Process Monitoring
+
+In production, monitor the admin interface processes:
+
+```bash
+# Check running processes
+ps aux | grep "snuba-admin"
+
+# Monitor resource usage
+top -p $(pgrep -f "snuba-admin")
+```
+
+## Integration with Snuba
+
+The admin interface runs as a separate service from the main Snuba API:
+
+<Tabs>
+  <Tab title="Separate Services">
+    ```bash
+    # Terminal 1: Start API
+    snuba api --processes 4
+    
+    # Terminal 2: Start Admin
+    snuba admin --processes 2
+    ```
+    
+    Best for production where admin traffic is separate from query traffic.
+  </Tab>
+  
+  <Tab title="Development Server">
+    ```bash
+    # Starts both API and Admin
+    snuba devserver
+    ```
+    
+    Both services start automatically:
+    - API: `http://127.0.0.1:1218/`
+    - Admin: `http://127.0.0.1:1219/`
+  </Tab>
+</Tabs>
+
+## Security Considerations
+
+<Warning>
+  The admin interface provides powerful system access. In production:
+  
+  1. **Restrict Network Access**
+     ```bash
+     # Bind to localhost only
+     export ADMIN_HOST=127.0.0.1
+     snuba admin
+     ```
+     Use a reverse proxy (nginx, Apache) with authentication.
+  
+  2. **Use Authentication**
+     Configure authentication in your reverse proxy.
+  
+  3. **Enable TLS**
+     Always use HTTPS in production via reverse proxy.
+  
+  4. **Firewall Rules**
+     Restrict admin port access to authorized IPs only.
+  
+  5. **Never Use Debug Mode**
+     Debug mode exposes code execution capabilities.
+</Warning>
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Port Already in Use">
+    If the admin port is already bound:
+    
+    ```bash
+    # Check what's using the port
+    lsof -i :1219
+    
+    # Change the port
+    export ADMIN_PORT=8080
+    snuba admin
+    ```
+  </Accordion>
+  
+  <Accordion title="Can't Start Multiple Processes in Debug">
+    Error: "processes/threads can only be 1 in debug"
+    
+    ```bash
+    # Solution: Remove --debug or use single process
+    snuba admin --processes 1 --threads 1
+    
+    # Or disable debug mode
+    snuba admin --processes 4 --threads 8
+    ```
+  </Accordion>
+  
+  <Accordion title="Connection Refused">
+    If you can't connect to the admin interface:
+    
+    1. Verify it's running:
+       ```bash
+       ps aux | grep snuba-admin
+       ```
+    
+    2. Check the binding address:
+       ```bash
+       # May need to bind to 0.0.0.0
+       export ADMIN_HOST=0.0.0.0
+       snuba admin
+       ```
+    
+    3. Check firewall rules:
+       ```bash
+       # Allow admin port
+       sudo ufw allow 1219
+       ```
+  </Accordion>
+  
+  <Accordion title="High Memory Usage">
+    If consuming too much memory:
+    
+    1. Reduce process count:
+       ```bash
+       snuba admin --processes 2 --threads 4
+       ```
+    
+    2. Monitor memory per process:
+       ```bash
+       ps aux --sort=-rss | grep snuba-admin
+       ```
+    
+    3. Consider setting worker limits in uWSGI configuration
+  </Accordion>
+  
+  <Accordion title="Slow Response Times">
+    If the admin interface is slow:
+    
+    1. Increase workers:
+       ```bash
+       snuba admin --processes 4 --threads 8
+       ```
+    
+    2. Check ClickHouse connectivity:
+       ```bash
+       # Admin queries ClickHouse for status
+       clickhouse-client --query "SELECT 1"
+       ```
+    
+    3. Enable connection pooling in settings.py
+    
+    4. Monitor query performance in logs:
+       ```bash
+       snuba admin --log-level debug
+       ```
+  </Accordion>
+</AccordionGroup>
+
+## Common Workflows
+
+### Local Development
+
+```bash
+# Quick start with auto-reload
+snuba admin --debug
+
+# Access at http://127.0.0.1:1219/
+# Make code changes and refresh browser
+```
+
+### Testing Admin Changes
+
+```bash
+# Start with debug logging
+snuba admin --debug --log-level debug
+
+# Check logs for errors
+# Test features in browser
+# Iterate on changes
+```
+
+### Production Deployment
+
+<Steps>
+  <Step title="Configure Environment">
+    ```bash
+    export ADMIN_HOST=127.0.0.1
+    export ADMIN_PORT=1219
+    ```
+  </Step>
+  
+  <Step title="Start Admin Service">
+    ```bash
+    snuba admin \
+      --processes 4 \
+      --threads 8 \
+      --backlog 256 \
+      --log-level warning
+    ```
+  </Step>
+  
+  <Step title="Configure Reverse Proxy">
+    Setup nginx/Apache with:
+    - TLS termination
+    - Authentication
+    - Rate limiting
+  </Step>
+  
+  <Step title="Monitor">
+    - Check process health
+    - Monitor memory usage
+    - Review error logs
+  </Step>
+</Steps>
+
+## Environment Variables
+
+The admin command respects:
+
+```bash
+# Service binding
+ADMIN_HOST=0.0.0.0
+ADMIN_PORT=1219
+
+# Logging (when not specified via --log-level)
+LOG_LEVEL=info
+
+# General Snuba settings
+CLICKHOUSE_HOST=localhost
+CLICKHOUSE_PORT=9000
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="API Server" icon="server" href="/cli/overview#api-server">
+    Learn about the main query API
+  </Card>
+  <Card title="Development Server" icon="laptop-code" href="/cli/devserver">
+    Start all services for development
+  </Card>
+  <Card title="Configuration" icon="gear" href="/configuration/overview">
+    Configure Snuba settings
+  </Card>
+  <Card title="Monitoring" icon="chart-line" href="/operations/monitoring">
+    Monitor Snuba in production
+  </Card>
+</CardGroup>

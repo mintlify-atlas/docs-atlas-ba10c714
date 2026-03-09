@@ -1,0 +1,572 @@
+---
+title: Subscription Configuration
+description: Configure real-time query subscriptions with validation rules and processing logic
+---
+
+Snuba supports real-time query subscriptions that continuously evaluate queries and deliver results when conditions are met. Subscription configuration defines validation rules and processing logic for these real-time queries.
+
+## Overview
+
+Subscription configuration controls:
+
+- **Aggregation limits**: Maximum number of aggregations per query
+- **Disallowed operations**: Operations not permitted in subscriptions
+- **Validation rules**: Custom validators for subscription queries
+- **Processing logic**: Custom processors for subscription execution
+- **Time column requirements**: Time-based filtering rules
+
+## Configuration Levels
+
+Subscription configuration exists at two levels:
+
+<CardGroup cols={2}>
+  <Card title="Entity-Level" icon="cube">
+    Defined in entity YAML files. Applies to all subscriptions on that entity.
+  </Card>
+  <Card title="Storage-Level" icon="hard-drive">
+    Defined in writable storage YAML files. Controls subscription infrastructure.
+  </Card>
+</CardGroup>
+
+## Entity Subscription Configuration
+
+### Schema
+
+<ParamField path="subscription_validators" type="array">
+  Array of validator configurations for subscription queries.
+</ParamField>
+
+<ParamField path="subscription_processors" type="array">
+  Array of processor configurations for subscription execution.
+</ParamField>
+
+### Basic Example
+
+```yaml Entity Subscription Config
+version: v1
+kind: entity
+name: events
+
+# ... other entity configuration ...
+
+subscription_validators:
+  - validator: AggregationValidator
+    args:
+      max_allowed_aggregations: 10
+      disallowed_aggregations:
+        - having
+        - orderby
+      required_time_column: timestamp
+      allows_group_by_without_condition: true
+```
+
+## Subscription Validators
+
+Validators enforce rules on subscription queries:
+
+### AggregationValidator
+
+Controls aggregation complexity:
+
+<ParamField path="max_allowed_aggregations" type="integer">
+  Maximum number of aggregation functions allowed per query.
+</ParamField>
+
+<ParamField path="disallowed_aggregations" type="array">
+  Array of clause types not allowed in subscriptions (e.g., `having`, `orderby`).
+</ParamField>
+
+<ParamField path="required_time_column" type="string">
+  Name of the time column that must be filtered in subscription queries.
+</ParamField>
+
+<ParamField path="allows_group_by_without_condition" type="boolean">
+  Whether GROUP BY is allowed without WHERE conditions.
+</ParamField>
+
+```yaml Aggregation Validator
+subscription_validators:
+  - validator: AggregationValidator
+    args:
+      max_allowed_aggregations: 10
+      disallowed_aggregations:
+        - having
+        - orderby
+      required_time_column: timestamp
+      allows_group_by_without_condition: true
+```
+
+### Custom Validators
+
+You can register custom validators:
+
+```python Custom Validator
+from snuba.datasets.entity_subscriptions.validators import EntitySubscriptionValidator
+
+@EntitySubscriptionValidator.register("CustomSubscriptionValidator")
+class CustomSubscriptionValidator(EntitySubscriptionValidator):
+    def validate(self, query, entity):
+        # Custom validation logic
+        if not self._is_valid(query):
+            raise InvalidQueryException("Query violates custom rules")
+```
+
+```yaml Using Custom Validator
+subscription_validators:
+  - validator: CustomSubscriptionValidator
+    args:
+      custom_param: value
+```
+
+## Subscription Processors
+
+Processors transform subscription queries before execution:
+
+```yaml Subscription Processors
+subscription_processors:
+  - processor: AddColumnProcessor
+    args:
+      column_name: organization_id
+      
+  - processor: MetricsTimeProcessor
+    args:
+      time_column: timestamp
+```
+
+### Common Processors
+
+<AccordionGroup>
+  <Accordion title="AddColumnProcessor">
+    Automatically adds required columns to subscription queries.
+    
+    ```yaml
+    - processor: AddColumnProcessor
+      args:
+        column_name: project_id
+    ```
+  </Accordion>
+
+  <Accordion title="MetricsTimeProcessor">
+    Processes time-based aggregations for metrics subscriptions.
+    
+    ```yaml
+    - processor: MetricsTimeProcessor
+      args:
+        time_column: timestamp
+        granularity: 60
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Storage Subscription Configuration
+
+Writable storages configure subscription infrastructure:
+
+```yaml Storage Subscription Config
+version: v1
+kind: writable_storage
+name: errors
+
+# ... other storage configuration ...
+
+stream_loader:
+  processor: ErrorsProcessor
+  default_topic: events
+  
+  # Subscription topics
+  subscription_scheduled_topic: scheduled-subscriptions-events
+  subscription_result_topic: events-subscription-results
+  
+  # Subscription scheduling
+  subscription_scheduler_mode: partition
+  subscription_synchronization_timestamp: received_p99
+  subscription_delay_seconds: 30
+```
+
+### Subscription Stream Configuration
+
+<ParamField path="subscription_scheduled_topic" type="string">
+  Kafka topic for scheduled subscription executions.
+</ParamField>
+
+<ParamField path="subscription_result_topic" type="string">
+  Kafka topic where subscription results are published.
+</ParamField>
+
+<ParamField path="subscription_scheduler_mode" type="string">
+  Scheduler mode: `partition` (per-partition scheduling) or `global` (global scheduling).
+</ParamField>
+
+<ParamField path="subscription_synchronization_timestamp" type="string">
+  Timestamp field for synchronization:
+  - `orig_message_ts` - Use original message timestamp
+  - `received_p99` - Use 99th percentile of received timestamp
+</ParamField>
+
+<ParamField path="subscription_delay_seconds" type="integer">
+  Additional delay in seconds before executing subscriptions (0-120).
+</ParamField>
+
+## Complete Examples
+
+### Events Entity Subscriptions
+
+```yaml events.yaml
+version: v1
+kind: entity
+name: events
+
+schema:
+  - name: project_id
+    type: UInt
+    args:
+      size: 64
+  - name: timestamp
+    type: DateTime
+  - name: event_id
+    type: UUID
+  - name: message
+    type: String
+
+required_time_column: timestamp
+
+# ... storage and query configuration ...
+
+subscription_validators:
+  - validator: AggregationValidator
+    args:
+      max_allowed_aggregations: 10
+      disallowed_aggregations:
+        - having
+        - orderby
+      required_time_column: timestamp
+      allows_group_by_without_condition: true
+```
+
+### Errors Storage Subscriptions
+
+```yaml errors.yaml
+version: v1
+kind: writable_storage
+name: errors
+
+storage:
+  key: errors
+  set_key: events
+
+readiness_state: complete
+
+schema:
+  columns:
+    - name: project_id
+      type: UInt
+      args:
+        size: 64
+    - name: timestamp
+      type: DateTime
+        
+  local_table_name: errors_local
+  dist_table_name: errors_dist
+
+stream_loader:
+  processor: ErrorsProcessor
+  default_topic: events
+  commit_log_topic: snuba-commit-log
+  
+  # Subscription configuration
+  subscription_scheduler_mode: partition
+  subscription_scheduled_topic: scheduled-subscriptions-events
+  subscription_result_topic: events-subscription-results
+  subscription_synchronization_timestamp: received_p99
+  subscription_delay_seconds: 30
+```
+
+### Metrics Entity Subscriptions
+
+```yaml metrics_counters.yaml
+version: v1
+kind: entity
+name: generic_metrics_counters
+
+schema:
+  - name: org_id
+    type: UInt
+    args:
+      size: 64
+  - name: project_id
+    type: UInt
+    args:
+      size: 64
+  - name: timestamp
+    type: DateTime
+  - name: metric_id
+    type: UInt
+    args:
+      size: 64
+  - name: value
+    type: Float
+    args:
+      size: 64
+
+required_time_column: timestamp
+
+# ... storage configuration ...
+
+subscription_validators:
+  - validator: AggregationValidator
+    args:
+      max_allowed_aggregations: 5
+      disallowed_aggregations:
+        - having
+        - orderby
+        - groupby  # No GROUP BY for metrics
+      required_time_column: timestamp
+      allows_group_by_without_condition: false
+
+subscription_processors:
+  - processor: MetricsTimeProcessor
+    args:
+      time_column: timestamp
+      granularity: 60
+```
+
+## Subscription Scheduler Modes
+
+### Partition Mode
+
+Schedules subscriptions per Kafka partition:
+
+```yaml Partition Mode
+subscription_scheduler_mode: partition
+```
+
+**Advantages**:
+- Better parallelism
+- Partition-level ordering guarantees
+- Scales with Kafka partitions
+
+**Use when**:
+- High subscription volume
+- Partition-level ordering is sufficient
+- Horizontal scaling is needed
+
+### Global Mode
+
+Schedules subscriptions globally across all partitions:
+
+```yaml Global Mode
+subscription_scheduler_mode: global
+```
+
+**Advantages**:
+- Global ordering guarantees
+- Simpler coordination
+- Better for low-volume subscriptions
+
+**Use when**:
+- Strict global ordering required
+- Lower subscription volume
+- Simpler deployment preferred
+
+## Subscription Delays
+
+Control when subscriptions execute relative to data arrival:
+
+```yaml Subscription Timing
+subscription_synchronization_timestamp: received_p99
+subscription_delay_seconds: 30
+```
+
+### Synchronization Timestamps
+
+<AccordionGroup>
+  <Accordion title="orig_message_ts">
+    Use the original message timestamp from the event.
+    
+    **Advantages**: Reflects actual event time
+    
+    **Disadvantages**: Doesn't account for ingestion delays
+    
+    **Use with**: Higher delay_seconds (e.g., 60) to account for ingestion
+  </Accordion>
+
+  <Accordion title="received_p99">
+    Use the 99th percentile of message received time.
+    
+    **Advantages**: Accounts for ingestion delays automatically
+    
+    **Disadvantages**: May lag behind real-time slightly
+    
+    **Use with**: Lower delay_seconds (e.g., 30)
+  </Accordion>
+</AccordionGroup>
+
+### Delay Seconds
+
+Additional buffer time before executing subscriptions:
+
+- **Low delay (10-30s)**: Fast results, may miss late-arriving data
+- **Medium delay (30-60s)**: Balanced, catches most data
+- **High delay (60-120s)**: Catches late data, slower results
+
+<Note>
+The `subscription_delay_seconds` must be between 0 and 120 seconds. Choose based on your data latency requirements.
+</Note>
+
+## Query Examples
+
+Subscription queries follow standard SnQL syntax with validation:
+
+<CodeGroup>
+```sql Valid Subscription
+MATCH (events)
+SELECT count() AS count
+WHERE project_id = 1
+  AND timestamp >= toDateTime('2023-01-01 00:00:00')
+  AND timestamp < toDateTime('2023-01-01 01:00:00')
+GROUP BY tags[environment]
+```
+
+```sql Invalid - Too Many Aggregations
+-- ❌ Exceeds max_allowed_aggregations: 10
+MATCH (events)
+SELECT
+  count() AS count,
+  uniq(user_id) AS users,
+  avg(duration) AS avg_duration,
+  min(duration) AS min_duration,
+  max(duration) AS max_duration,
+  sum(bytes) AS total_bytes,
+  stddev(duration) AS stddev_duration,
+  median(duration) AS median_duration,
+  quantile(0.95)(duration) AS p95,
+  quantile(0.99)(duration) AS p99,
+  topK(10)(url) AS top_urls  # 11th aggregation - INVALID
+WHERE project_id = 1
+```
+
+```sql Invalid - Disallowed HAVING
+-- ❌ HAVING is disallowed
+MATCH (events)
+SELECT count() AS count
+WHERE project_id = 1
+GROUP BY tags[environment]
+HAVING count > 100  # HAVING not allowed
+```
+
+```sql Invalid - Missing Time Filter
+-- ❌ Missing required_time_column filter
+MATCH (events)
+SELECT count() AS count
+WHERE project_id = 1
+# Missing: AND timestamp >= ... AND timestamp < ...
+```
+</CodeGroup>
+
+## Creating Subscriptions
+
+Create subscriptions via the Snuba API:
+
+```python Create Subscription
+import requests
+
+subscription = {
+    "project_id": 1,
+    "type": "query",
+    "dataset": "events",
+    "query": """
+        MATCH (events)
+        SELECT count() AS count
+        WHERE project_id = 1
+          AND timestamp >= now() - 3600
+          AND timestamp < now()
+        GROUP BY tags[environment]
+    """,
+    "time_window": 60,  # Check every 60 seconds
+    "resolution": 60     # 1-minute granularity
+}
+
+response = requests.post(
+    "http://localhost:1218/subscriptions",
+    json=subscription
+)
+
+subscription_id = response.json()["subscription_id"]
+```
+
+## Best Practices
+
+<CardGroup cols={2}>
+  <Card title="Limit Complexity" icon="gauge-simple">
+    Set reasonable max_allowed_aggregations to prevent expensive subscription queries.
+  </Card>
+  
+  <Card title="Require Time Filters" icon="clock">
+    Always require time column filters to prevent full table scans.
+  </Card>
+  
+  <Card title="Use Partition Mode" icon="grid">
+    Prefer partition mode for scalability with high subscription volumes.
+  </Card>
+  
+  <Card title="Tune Delays" icon="clock-rotate-left">
+    Balance between result freshness and data completeness with appropriate delays.
+  </Card>
+</CardGroup>
+
+## Monitoring Subscriptions
+
+Monitor subscription health:
+
+- **Scheduled topic lag**: Check Kafka lag on scheduled topic
+- **Result topic throughput**: Monitor result topic message rate
+- **Query execution time**: Track subscription query performance
+- **Validation failures**: Monitor validation error rates
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Validation Failures">
+    **Symptom**: Subscriptions rejected with validation errors
+    
+    **Solutions**:
+    - Check max_allowed_aggregations limit
+    - Verify required_time_column is filtered
+    - Remove disallowed clauses (HAVING, ORDER BY)
+    - Ensure GROUP BY has WHERE conditions if required
+  </Accordion>
+
+  <Accordion title="Late Results">
+    **Symptom**: Subscription results arrive later than expected
+    
+    **Solutions**:
+    - Reduce subscription_delay_seconds
+    - Check Kafka consumer lag
+    - Verify subscription_synchronization_timestamp setting
+    - Monitor query execution times
+  </Accordion>
+
+  <Accordion title="Missing Data">
+    **Symptom**: Subscriptions miss some events
+    
+    **Solutions**:
+    - Increase subscription_delay_seconds
+    - Use received_p99 synchronization timestamp
+    - Check Kafka retention settings
+    - Verify partition assignment
+  </Accordion>
+</AccordionGroup>
+
+## Related Configuration
+
+<CardGroup cols={3}>
+  <Card title="Entities" icon="cube" href="/configuration/entities">
+    Configure entity-level subscription validators
+  </Card>
+  <Card title="Storages" icon="hard-drive" href="/configuration/storages">
+    Set up storage-level subscription infrastructure
+  </Card>
+  <Card title="Overview" icon="book" href="/configuration/overview">
+    Configuration system overview
+  </Card>
+</CardGroup>

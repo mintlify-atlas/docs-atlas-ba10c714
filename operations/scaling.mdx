@@ -1,0 +1,712 @@
+---
+title: Scaling
+description: Scale Snuba horizontally and vertically to handle increasing load and data volume
+---
+
+Snuba is designed to scale horizontally across multiple dimensions. This guide covers scaling strategies for API servers, consumers, and ClickHouse storage.
+
+## Scaling Overview
+
+Snuba consists of three independently scalable components:
+
+<Steps>
+
+<Step title="API Layer">
+Stateless query servers that can be scaled horizontally:
+- Scale based on query rate and latency
+- No coordination required between instances
+- Typically CPU-bound
+</Step>
+
+<Step title="Consumer Layer">
+Stateful Kafka consumers that ingest data:
+- Scale based on Kafka lag and throughput
+- Limited by Kafka partition count
+- Typically I/O and network bound
+</Step>
+
+<Step title="Storage Layer">
+ClickHouse clusters for data storage:
+- Scale based on data volume and query complexity
+- Requires careful planning for sharding
+- Both vertical and horizontal scaling options
+</Step>
+
+</Steps>
+
+## Scaling the API Layer
+
+### Horizontal Scaling
+
+API servers are stateless and can be scaled freely:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: snuba-api
+spec:
+  replicas: 10  # Scale to 10 replicas
+  selector:
+    matchLabels:
+      app: snuba
+      component: api
+  template:
+    spec:
+      containers:
+      - name: api
+        image: snuba:latest
+        resources:
+          requests:
+            memory: "2Gi"
+            cpu: "1"
+          limits:
+            memory: "4Gi"
+            cpu: "2"
+```
+
+### Auto-scaling Configuration
+
+Use Horizontal Pod Autoscaler (HPA):
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: snuba-api-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: snuba-api
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+      - type: Percent
+        value: 50
+        periodSeconds: 60
+      - type: Pods
+        value: 2
+        periodSeconds: 60
+      selectPolicy: Max
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 10
+        periodSeconds: 60
+```
+
+<Note>
+Set `minReplicas` to at least 2 for high availability. Use conservative scale-down policies to avoid thrashing.
+</Note>
+
+### Worker Configuration
+
+Configure workers per API pod:
+
+```python
+# settings.py
+API_WORKERS = 4  # Number of worker processes
+API_THREADS = 8  # Number of threads per worker
+
+# Total concurrent requests = API_WORKERS * API_THREADS = 32
+```
+
+```bash
+# Or via environment variables
+docker run -e API_WORKERS=4 -e API_THREADS=8 snuba:latest api
+```
+
+**Worker sizing guidelines:**
+
+- **CPU-bound workloads**: `workers = num_cores`
+- **I/O-bound workloads**: `workers = num_cores * 2-4`
+- **Threads per worker**: 4-8 for query serving
+- **Memory**: ~500MB base + 100MB per worker
+
+### Load Balancing
+
+Distribute traffic across API pods:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: snuba-api
+spec:
+  type: LoadBalancer
+  selector:
+    app: snuba
+    component: api
+  ports:
+  - port: 80
+    targetPort: 1218
+  sessionAffinity: None  # Round-robin distribution
+```
+
+### Connection Pool Tuning
+
+Optimize ClickHouse connections:
+
+```python
+# settings.py
+CLICKHOUSE_MAX_POOL_SIZE = 25  # Max connections per cluster
+
+CLUSTERS = [
+    {
+        "host": "clickhouse",
+        "port": 9000,
+        "max_connections": 10,  # Connections per API worker
+        "block_connections": False,  # Don't block on full pool
+    }
+]
+```
+
+<Warning>
+**Connection pool sizing**: Total connections = `API_WORKERS * max_connections * num_pods`. Ensure ClickHouse can handle the total connection count (default max: 4096).
+</Warning>
+
+## Scaling Consumers
+
+### Understanding Consumer Scaling
+
+Consumer scaling is limited by Kafka partition count:
+
+```
+Max consumer replicas = Number of Kafka partitions
+```
+
+Example: A topic with 16 partitions can have max 16 consumer instances in the same consumer group.
+
+### Horizontal Scaling
+
+Scale consumers based on lag:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: snuba-consumer-errors
+spec:
+  replicas: 8  # Match partition count for best performance
+  selector:
+    matchLabels:
+      app: snuba
+      component: consumer
+      storage: errors
+  template:
+    spec:
+      containers:
+      - name: consumer
+        image: snuba:latest
+        command:
+        - snuba
+        - consumer
+        - --storage=errors
+        - --consumer-group=snuba-consumers
+        - --max-batch-size=50000
+        - --max-batch-time-ms=2000
+        - --processes=2  # Parallel processing within consumer
+        resources:
+          requests:
+            memory: "2Gi"
+            cpu: "1"
+          limits:
+            memory: "8Gi"
+            cpu: "4"
+```
+
+### Per-Storage Scaling
+
+Each storage type can be scaled independently:
+
+```bash
+# Scale errors consumer
+kubectl scale deployment snuba-consumer-errors --replicas=16
+
+# Scale transactions consumer
+kubectl scale deployment snuba-consumer-transactions --replicas=8
+
+# Scale metrics consumer
+kubectl scale deployment snuba-consumer-metrics --replicas=4
+```
+
+### Batch Size Tuning
+
+Optimize batch sizes for throughput:
+
+```python
+# Default batch configuration
+DEFAULT_MAX_BATCH_SIZE = 50000  # Max messages per batch
+DEFAULT_MAX_BATCH_TIME_MS = 2000  # Max time to wait for batch
+
+# Tuning guidelines:
+# - High throughput, low latency: smaller batches (10k-25k)
+# - High throughput, latency tolerant: larger batches (50k-100k)
+# - Low throughput: shorter time window (500-1000ms)
+```
+
+```bash
+# Consumer with optimized batching
+snuba consumer \
+  --storage=errors \
+  --max-batch-size=100000 \
+  --max-batch-time-ms=5000 \
+  --max-insert-batch-size=50000 \
+  --max-insert-batch-time-ms=2000
+```
+
+<Accordion title="Batch Size Guidelines by Storage">
+
+**Errors Storage:**
+- Batch size: 50,000 messages
+- Batch time: 2,000ms
+- Rationale: Balance between latency and throughput
+
+**Transactions Storage:**
+- Batch size: 75,000 messages
+- Batch time: 3,000ms
+- Rationale: Larger events, need bigger batches
+
+**Metrics Storage:**
+- Batch size: 100,000 messages
+- Batch time: 5,000ms
+- Rationale: Small events, high volume, can tolerate latency
+
+**Replays Storage:**
+- Batch size: 25,000 messages
+- Batch time: 1,000ms
+- Rationale: Large payloads, need quick flushing
+
+</Accordion>
+
+### Parallel Processing
+
+Increase processing parallelism within consumers:
+
+```bash
+snuba consumer \
+  --storage=errors \
+  --processes=4 \
+  --input-block-size=10000 \
+  --output-block-size=10000
+```
+
+**Process count guidelines:**
+- Start with 2 processes per consumer
+- Increase if CPU usage < 80%
+- Max: `num_cores - 1` to leave headroom
+- Monitor memory usage (each process needs ~1-2GB)
+
+### Kafka Consumer Configuration
+
+Optimize Kafka consumer settings:
+
+```bash
+snuba consumer \
+  --storage=errors \
+  --queued-max-messages-kbytes=100000 \
+  --queued-min-messages=50000 \
+  --max-poll-interval-ms=300000 \
+  --group-instance-id=consumer-1  # Static membership
+```
+
+<Note>
+**Static membership** (`group-instance-id`) reduces rebalancing overhead. Use unique IDs per pod (e.g., based on pod name).
+</Note>
+
+### Consumer Auto-scaling
+
+Scale based on Kafka lag using KEDA:
+
+```yaml
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: snuba-consumer-errors-scaler
+spec:
+  scaleTargetRef:
+    name: snuba-consumer-errors
+  minReplicaCount: 2
+  maxReplicaCount: 16
+  triggers:
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka:9092
+      consumerGroup: snuba-consumers
+      topic: ingest-events
+      lagThreshold: "1000000"  # Scale up if lag > 1M
+      offsetResetPolicy: latest
+```
+
+## Scaling ClickHouse
+
+### Vertical Scaling
+
+Increase resources for existing nodes:
+
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: clickhouse
+spec:
+  template:
+    spec:
+      containers:
+      - name: clickhouse
+        image: altinity/clickhouse-server:25.3.6.10034.altinitystable
+        resources:
+          requests:
+            memory: "16Gi"  # Increased from 8Gi
+            cpu: "4"        # Increased from 2
+          limits:
+            memory: "32Gi"  # Increased from 16Gi
+            cpu: "8"        # Increased from 4
+```
+
+**Vertical scaling benefits:**
+- Simpler than horizontal scaling
+- Better for single-node setups
+- Good for query-heavy workloads
+- No resharding required
+
+**Limitations:**
+- Single point of failure
+- Limited by node capacity
+- Can't exceed max node size
+
+### Horizontal Scaling with Sharding
+
+Distribute data across multiple nodes. See [ClickHouse Topology](/operations/clickhouse-topology) for detailed cluster setup.
+
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: clickhouse-shard
+spec:
+  replicas: 3  # 3 shards
+  serviceName: clickhouse-shard
+  template:
+    spec:
+      containers:
+      - name: clickhouse
+        image: altinity/clickhouse-server:25.3.6.10034.altinitystable
+        volumeMounts:
+        - name: config
+          mountPath: /etc/clickhouse-server/config.d
+```
+
+### Storage Slicing
+
+Snuba supports storage slicing for horizontal scaling:
+
+```python
+# settings.py
+SLICED_STORAGE_SETS = {
+    "events": 4,  # 4 slices for events storage
+}
+
+# Each slice gets its own:
+# - ClickHouse cluster
+# - Kafka topics  
+# - Consumer group
+```
+
+**Slicing configuration:**
+
+```python
+SLICED_CLUSTERS = [
+    {
+        "host": "clickhouse-slice-0",
+        "storage_sets": {("events", 0)},  # Slice 0
+    },
+    {
+        "host": "clickhouse-slice-1",
+        "storage_sets": {("events", 1)},  # Slice 1
+    },
+    {
+        "host": "clickhouse-slice-2",
+        "storage_sets": {("events", 2)},  # Slice 2
+    },
+    {
+        "host": "clickhouse-slice-3",
+        "storage_sets": {("events", 3)},  # Slice 3
+    },
+]
+
+SLICED_KAFKA_TOPIC_MAP = {
+    ("ingest-events", 0): "ingest-events-slice-0",
+    ("ingest-events", 1): "ingest-events-slice-1",
+    ("ingest-events", 2): "ingest-events-slice-2",
+    ("ingest-events", 3): "ingest-events-slice-3",
+}
+
+LOGICAL_PARTITION_MAPPING = {
+    "events": {
+        0: 0,  # Partition 0 -> Slice 0
+        1: 1,  # Partition 1 -> Slice 1
+        2: 2,  # Partition 2 -> Slice 2  
+        3: 3,  # Partition 3 -> Slice 3
+    }
+}
+```
+
+### Storage Volume Expansion
+
+Expand persistent volumes:
+
+```bash
+# Edit PVC to increase size
+kubectl edit pvc data-clickhouse-0
+
+# Change spec.resources.requests.storage:
+spec:
+  resources:
+    requests:
+      storage: 500Gi  # Increased from 100Gi
+
+# Kubernetes will automatically expand the volume
+```
+
+<Warning>
+Volume expansion requires a storage class that supports expansion (`allowVolumeExpansion: true`). The pod may need to be restarted for the expansion to take effect.
+</Warning>
+
+## Performance Optimization
+
+### Query Optimization
+
+Optimize expensive queries:
+
+1. **Add indexes** for frequently filtered columns
+2. **Use materialized views** for common aggregations
+3. **Partition pruning** - structure queries to use partition keys
+4. **Limit result sets** - use LIMIT clauses
+5. **Avoid SELECT *** - specify needed columns only
+
+### Table Optimization
+
+Regularly optimize tables:
+
+```bash
+# Run optimize job as Kubernetes CronJob
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: snuba-optimize
+spec:
+  schedule: "0 2 * * *"  # Daily at 2 AM UTC
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+          - name: optimize
+            image: snuba:latest
+            command: ["snuba", "optimize"]
+            env:
+            - name: SNUBA_SETTINGS
+              value: "production"
+```
+
+**Optimize configuration:**
+
+```python
+OPTIMIZE_JOB_CUTOFF_TIME = 23  # Stop at 11 PM UTC
+OPTIMIZE_QUERY_TIMEOUT = 14400  # 4 hour timeout
+OPTIMIZE_BASE_SLEEP_TIME = 300  # 5 min between checks
+OPTIMIZE_MAX_SLEEP_TIME = 7200  # Max 2 hours wait
+```
+
+### Retention Management
+
+Manage data retention:
+
+```python
+ENFORCE_RETENTION = True
+DEFAULT_RETENTION_DAYS = 90
+LOWER_RETENTION_DAYS = 30
+```
+
+```bash
+# Run cleanup job
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: snuba-cleanup
+spec:
+  schedule: "0 3 * * *"  # Daily at 3 AM UTC
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+          - name: cleanup
+            image: snuba:latest
+            command: ["snuba", "cleanup"]
+```
+
+## Capacity Planning
+
+### Estimating Storage Needs
+
+**Events storage:**
+```
+Daily events: 1 billion
+Avg event size: 2 KB
+Daily storage: 1B * 2KB = 2 TB
+With compression (4x): 500 GB/day
+90-day retention: 45 TB
+```
+
+**Metrics storage:**
+```
+Daily metrics: 10 billion
+Avg metric size: 200 bytes
+Daily storage: 10B * 200B = 2 TB
+With compression (10x): 200 GB/day
+90-day retention: 18 TB
+```
+
+<Note>
+Add 50% overhead for indexes, merges, and temporary data. Plan for 3x current usage to allow for growth.
+</Note>
+
+### Computing Resource Requirements
+
+**API servers:**
+- 1 core per 100 QPS
+- 2-4 GB RAM per core
+- Min 2 replicas for HA
+
+**Consumers:**
+- 1 core per 50k messages/sec
+- 2-4 GB RAM per core
+- 1 consumer per Kafka partition (max)
+
+**ClickHouse:**
+- 1 core per 50 QPS
+- 4-8 GB RAM per core
+- RAM should be 2-4x total dataset size for hot data
+
+### Scaling Timeline
+
+<Steps>
+
+<Step title="Current State (0-3 months)">
+- 3 API replicas
+- 4 consumer replicas per storage
+- 1 ClickHouse node (16 cores, 64GB RAM)
+- 100 GB storage per day
+</Step>
+
+<Step title="6 Month Projection">
+- 6 API replicas (+100%)
+- 8 consumer replicas per storage (+100%)
+- 3 ClickHouse nodes (scale out)
+- 200 GB storage per day
+</Step>
+
+<Step title="12 Month Projection">
+- 12 API replicas (+100%)
+- 16 consumer replicas per storage (+100%)
+- 6 ClickHouse nodes (scale out)
+- 500 GB storage per day
+</Step>
+
+</Steps>
+
+## Monitoring Scaling Metrics
+
+### Key Metrics to Watch
+
+```
+# API scaling indicators
+api.cpu.usage > 70%
+api.memory.usage > 80%
+api.request_queue > 100
+query.latency.p95 > 5s
+
+# Consumer scaling indicators  
+consumer.lag > 1M
+consumer.cpu.usage > 80%
+consumer.processing_time.p95 > 10s
+consumer.error_rate > 1%
+
+# ClickHouse scaling indicators
+clickhouse.cpu.usage > 80%
+clickhouse.memory.usage > 85%
+clickhouse.disk.usage > 75%
+clickhouse.query.queue > 50
+```
+
+## Best Practices
+
+1. **Scale proactively**: Don't wait for alerts, scale before hitting limits
+2. **Test scaling**: Practice scaling operations in staging
+3. **Monitor continuously**: Watch metrics trends, not just current values
+4. **Automate scaling**: Use HPA and KEDA for automatic scaling
+5. **Document capacity**: Keep capacity planning docs up-to-date
+6. **Plan for peaks**: Size for 2-3x normal load to handle spikes
+7. **Scale gradually**: Increase by 25-50% at a time
+8. **Balance costs**: Over-provisioning is expensive, under-provisioning is worse
+
+## Troubleshooting
+
+### High API Latency
+
+```bash
+# Check if API pods are CPU-bound
+kubectl top pods -l component=api
+
+# Scale up if CPU > 80%
+kubectl scale deployment snuba-api --replicas=10
+
+# Check ClickHouse query performance
+SELECT query, elapsed FROM system.processes WHERE elapsed > 5;
+```
+
+### Consumer Lag Not Decreasing
+
+```bash
+# Check consumer CPU usage
+kubectl top pods -l component=consumer
+
+# Scale up consumers (max = partition count)
+kubectl scale deployment snuba-consumer-errors --replicas=16
+
+# Check ClickHouse insert performance
+SELECT * FROM system.metrics WHERE metric LIKE '%Insert%';
+```
+
+### ClickHouse Out of Memory
+
+```bash
+# Check memory usage
+SELECT * FROM system.metrics WHERE metric = 'MemoryTracking';
+
+# Kill long-running queries
+KILL QUERY WHERE elapsed > 300;
+
+# Scale vertically or add nodes
+kubectl edit statefulset clickhouse
+```

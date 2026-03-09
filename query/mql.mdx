@@ -1,0 +1,580 @@
+---
+title: MQL Syntax
+description: Complete reference for the Metrics Query Language (MQL)
+---
+
+MQL (Metrics Query Language) is a specialized query language for querying metrics and timeseries data in Snuba. It provides a concise syntax for aggregating, filtering, and combining metrics.
+
+## Overview
+
+MQL queries consist of:
+- **Timeseries**: Aggregations over metrics
+- **Filters**: Conditions on metric tags
+- **Grouping**: Group results by tag values
+- **Formulas**: Arithmetic operations and functions over timeseries
+
+Unlike SnQL, MQL queries are designed specifically for metrics data and include additional context like time ranges and rollup configuration.
+
+## Query Structure
+
+An MQL query has two parts:
+
+1. **Query String**: The MQL expression
+2. **Context Object**: Metadata about the query (time range, scope, etc.)
+
+```json
+{
+  "mql": "sum(transaction.duration){environment:prod} by status_code",
+  "mql_context": {
+    "entity": "generic_metrics_distributions",
+    "start": "2023-01-02T03:04:05+00:00",
+    "end": "2023-01-16T03:04:05+00:00",
+    "rollup": {
+      "granularity": 3600,
+      "interval": 3600,
+      "with_totals": null
+    },
+    "scope": {
+      "org_ids": [1],
+      "project_ids": [11],
+      "use_case_id": "transactions"
+    },
+    "limit": 100,
+    "offset": 0
+  }
+}
+```
+
+## Timeseries
+
+The core building block of MQL is the timeseries, which represents an aggregation over a metric.
+
+### Basic Syntax
+
+```
+aggregate(metric_name)
+```
+
+<CodeGroup>
+
+```mql Counter Metric
+sum(c:transactions/count_per_root_project@none)
+```
+
+```mql Distribution Metric
+quantiles(0.95)(d:transactions/duration@millisecond)
+```
+
+```mql Set Metric
+uniq(s:transactions/user@none)
+```
+
+```mql Gauge Metric
+avg(g:transactions/memory_usage@byte)
+```
+
+</CodeGroup>
+
+### Metric Identifiers
+
+Metrics can be referenced by:
+- **Public name**: `transaction.duration`
+- **MRI (Metric Resource Identifier)**: `d:transactions/duration@millisecond`
+
+The MRI format is:
+```
+type:namespace/name@unit
+```
+
+Where:
+- `type`: `c` (counter), `d` (distribution), `s` (set), `g` (gauge)
+- `namespace`: Metric category (e.g., `transactions`, `sessions`)
+- `name`: Metric name
+- `unit`: Unit of measurement
+
+### Aggregation Functions
+
+<Tabs>
+  <Tab title="Counter Metrics">
+    - `sum()` - Sum of all values
+    - `count()` - Count of data points
+    - `avg()` - Average value
+    - `min()` - Minimum value
+    - `max()` - Maximum value
+  </Tab>
+  <Tab title="Distribution Metrics">
+    - `quantile(p)` - Single quantile (e.g., `quantile(0.95)`)
+    - `quantiles(p1, p2, ...)` - Multiple quantiles
+    - `avg()` - Average of distribution
+    - `sum()` - Sum of distribution
+    - `min()` - Minimum value
+    - `max()` - Maximum value
+    - `count()` - Count of values
+  </Tab>
+  <Tab title="Set Metrics">
+    - `uniq()` - Unique count
+    - `count()` - Count of sets
+  </Tab>
+  <Tab title="Gauge Metrics">
+    - `avg()` - Average of gauge values
+    - `min()` - Minimum gauge value
+    - `max()` - Maximum gauge value
+    - `last()` - Last recorded value
+  </Tab>
+</Tabs>
+
+## Filtering
+
+Filter timeseries by tag values using curly braces:
+
+```mql
+sum(transaction.duration){environment:prod}
+```
+
+### Multiple Filters
+
+Use commas to combine filters (AND logic):
+
+```mql
+sum(transaction.duration){environment:prod, status_code:200}
+```
+
+### Negation
+
+Use `!` to negate a filter:
+
+```mql
+sum(transaction.duration){!status_code:500}
+```
+
+### Wildcard Matching
+
+Use `*` for wildcard patterns:
+
+```mql
+sum(transaction.duration){transaction:"/api/*"}
+```
+
+### Examples
+
+<CodeGroup>
+
+```mql Single Filter
+sum(transaction.duration){environment:prod}
+```
+
+```mql Multiple Filters
+sum(transaction.duration){environment:prod, transaction:"/api/users"}
+```
+
+```mql Negation
+count(transaction.duration){!status_code:200, !status_code:201}
+```
+
+```mql Wildcard
+sum(transaction.duration){transaction:"/api/*", environment:prod}
+```
+
+</CodeGroup>
+
+## Grouping
+
+Group results by tag values using `by`:
+
+```mql
+sum(transaction.duration) by status_code
+```
+
+### Multiple Groups
+
+```mql
+sum(transaction.duration) by status_code, environment
+```
+
+### Combining Filters and Grouping
+
+```mql
+sum(transaction.duration){environment:prod} by status_code, transaction
+```
+
+## Formulas
+
+Combine multiple timeseries with arithmetic operations.
+
+### Arithmetic Operators
+
+- `+` Addition
+- `-` Subtraction
+- `*` Multiplication
+- `/` Division
+
+### Examples
+
+<CodeGroup>
+
+```mql Failure Rate
+count(transaction.duration){!status_code:200} / count(transaction.duration)
+```
+
+```mql Total Latency
+sum(transaction.duration) + sum(transaction.measurements.fcp)
+```
+
+```mql Average per Transaction
+sum(transaction.duration) / count(transaction.duration)
+```
+
+```mql Rate Comparison
+(count(transaction.duration){environment:prod} - count(transaction.duration){environment:staging}) / count(transaction.duration){environment:prod}
+```
+
+</CodeGroup>
+
+## Functions
+
+MQL supports custom functions for advanced calculations.
+
+### Apdex
+
+Calculate Apdex score with a target threshold:
+
+```mql
+apdex(sum(transaction.duration), 300)
+```
+
+Parameters:
+- First argument: Duration timeseries
+- Second argument: Target threshold in milliseconds
+
+Apdex score formula:
+```
+(satisfied + tolerated/2) / total
+```
+
+Where:
+- Satisfied: duration ≤ threshold
+- Tolerated: threshold < duration ≤ 4 * threshold
+- Frustrated: duration > 4 * threshold
+
+### Combining Functions with Filters
+
+```mql
+apdex(sum(transaction.duration) + sum(transaction.measurements.fcp), 300){environment:prod} by status_code
+```
+
+## Context Object
+
+The `mql_context` object provides essential metadata for the query.
+
+### Time Range
+
+<ParamField path="start" type="string" required>
+  ISO 8601 timestamp for query start time
+</ParamField>
+
+<ParamField path="end" type="string" required>
+  ISO 8601 timestamp for query end time
+</ParamField>
+
+```json
+{
+  "start": "2023-01-02T03:04:05+00:00",
+  "end": "2023-01-16T03:04:05+00:00"
+}
+```
+
+### Rollup
+
+Controls time-based grouping and totals.
+
+<ParamField path="rollup.interval" type="integer">
+  Time interval for grouping results in seconds (e.g., 3600 for hourly)
+</ParamField>
+
+<ParamField path="rollup.granularity" type="integer">
+  Storage granularity in seconds (inferred from interval and time range)
+</ParamField>
+
+<ParamField path="rollup.with_totals" type="boolean">
+  If interval is set, determines whether to include a totals row. If interval is not set, returns a single aggregated value instead of a timeseries
+</ParamField>
+
+<ParamField path="rollup.orderby" type="string">
+  Column to order by when returning single values (no interval)
+</ParamField>
+
+```json
+{
+  "rollup": {
+    "interval": 3600,
+    "granularity": 3600,
+    "with_totals": true
+  }
+}
+```
+
+### Scope
+
+Defines the organizational scope of the query.
+
+<ParamField path="scope.org_ids" type="array" required>
+  List of organization IDs to query
+</ParamField>
+
+<ParamField path="scope.project_ids" type="array" required>
+  List of project IDs to query
+</ParamField>
+
+<ParamField path="scope.use_case_id" type="string" required>
+  Use case identifier (e.g., "transactions", "sessions", "performance")
+</ParamField>
+
+```json
+{
+  "scope": {
+    "org_ids": [1],
+    "project_ids": [11, 12, 13],
+    "use_case_id": "transactions"
+  }
+}
+```
+
+### Limits
+
+<ParamField path="limit" type="integer" default="100">
+  Maximum number of rows to return
+</ParamField>
+
+<ParamField path="offset" type="integer" default="0">
+  Number of rows to skip
+</ParamField>
+
+### Entity
+
+<ParamField path="entity" type="string" required>
+  Metrics entity to query:
+  - `generic_metrics_counters`
+  - `generic_metrics_distributions`
+  - `generic_metrics_sets`
+  - `generic_metrics_gauges`
+</ParamField>
+
+## Complete Examples
+
+### Transaction Error Rate Over Time
+
+```json
+{
+  "mql": "count(transaction.duration){!status_code:200} / count(transaction.duration)",
+  "mql_context": {
+    "entity": "generic_metrics_distributions",
+    "start": "2023-01-01T00:00:00+00:00",
+    "end": "2023-01-02T00:00:00+00:00",
+    "rollup": {
+      "interval": 3600,
+      "granularity": 3600,
+      "with_totals": false
+    },
+    "scope": {
+      "org_ids": [1],
+      "project_ids": [11],
+      "use_case_id": "transactions"
+    },
+    "limit": 1000
+  }
+}
+```
+
+### P95 Latency by Status Code
+
+```json
+{
+  "mql": "quantiles(0.95)(transaction.duration){environment:prod} by status_code",
+  "mql_context": {
+    "entity": "generic_metrics_distributions",
+    "start": "2023-01-01T00:00:00+00:00",
+    "end": "2023-01-02T00:00:00+00:00",
+    "rollup": {
+      "interval": 300,
+      "granularity": 60
+    },
+    "scope": {
+      "org_ids": [1],
+      "project_ids": [11, 12],
+      "use_case_id": "transactions"
+    },
+    "limit": 100
+  }
+}
+```
+
+### Apdex Score by Transaction
+
+```json
+{
+  "mql": "apdex(sum(transaction.duration), 300) by transaction",
+  "mql_context": {
+    "entity": "generic_metrics_distributions",
+    "start": "2023-01-01T00:00:00+00:00",
+    "end": "2023-01-02T00:00:00+00:00",
+    "rollup": {
+      "granularity": 60,
+      "with_totals": true,
+      "orderby": "aggregate_value"
+    },
+    "scope": {
+      "org_ids": [1],
+      "project_ids": [11],
+      "use_case_id": "transactions"
+    },
+    "limit": 50
+  }
+}
+```
+
+### Unique Users Across Environments
+
+```json
+{
+  "mql": "uniq(s:transactions/user@none) by environment",
+  "mql_context": {
+    "entity": "generic_metrics_sets",
+    "start": "2023-01-01T00:00:00+00:00",
+    "end": "2023-01-08T00:00:00+00:00",
+    "rollup": {
+      "interval": 86400,
+      "granularity": 3600
+    },
+    "scope": {
+      "org_ids": [1],
+      "project_ids": [11],
+      "use_case_id": "transactions"
+    },
+    "limit": 100
+  }
+}
+```
+
+## Response Format
+
+MQL queries return data in a timeseries format:
+
+```json
+{
+  "data": [
+    {
+      "time": "2023-01-01T00:00:00+00:00",
+      "aggregate_value": 123.45,
+      "status_code": "200"
+    },
+    {
+      "time": "2023-01-01T01:00:00+00:00",
+      "aggregate_value": 145.67,
+      "status_code": "200"
+    }
+  ],
+  "meta": [...],
+  "timing": {...},
+  "stats": {...}
+}
+```
+
+When grouped by tags, each unique tag combination appears in separate rows.
+
+## Using the Python SDK
+
+The [Snuba SDK](https://github.com/getsentry/snuba-sdk) provides Python classes for building MQL queries:
+
+```python
+from datetime import datetime, timedelta
+from snuba_sdk import (
+    Column,
+    Condition,
+    Metric,
+    MetricsQuery,
+    MetricsScope,
+    Op,
+    Rollup,
+    Timeseries,
+)
+
+query = MetricsQuery(
+    query=Timeseries(
+        metric=Metric(
+            public_name="transaction.duration",
+            mri="d:transactions/duration@millisecond",
+        ),
+        aggregate="quantiles(0.95)",
+        filters=[
+            Condition(Column("environment"), Op.EQ, "prod")
+        ],
+        groupby=[Column("status_code")],
+    ),
+    start=datetime(2023, 1, 1),
+    end=datetime(2023, 1, 2),
+    rollup=Rollup(interval=3600, granularity=3600),
+    scope=MetricsScope(
+        org_ids=[1],
+        project_ids=[11],
+        use_case_id="transactions",
+    ),
+    limit=100,
+)
+```
+
+## Best Practices
+
+- **Use appropriate aggregations**: Match aggregation function to metric type
+- **Keep time ranges reasonable**: Smaller ranges are more performant
+- **Leverage filters**: Filter at query time rather than post-processing
+- **Use appropriate granularity**: Match to your storage configuration
+- **Limit cardinality in grouping**: High-cardinality groups can be expensive
+- **Cache results when possible**: Repeated queries benefit from caching
+- **Use MRI when available**: More specific than public names
+
+<Warning>
+  Queries across different use case IDs are not supported. All metrics in a single query must share the same use case ID.
+</Warning>
+
+## Common Patterns
+
+### Failure Rate
+
+```mql
+count(transaction.duration){status_code:500} / count(transaction.duration)
+```
+
+### Success Rate
+
+```mql
+count(transaction.duration){status_code:200} / count(transaction.duration)
+```
+
+### Latency Breakdown
+
+```mql
+sum(transaction.duration) + sum(transaction.measurements.fcp) + sum(transaction.measurements.lcp)
+```
+
+### Environment Comparison
+
+```mql
+sum(transaction.duration){environment:prod} / sum(transaction.duration){environment:staging}
+```
+
+### Error Budget
+
+```mql
+1 - (count(transaction.duration){status_code:500} / count(transaction.duration))
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="SnQL Syntax" icon="code" href="/query/snql">
+    Learn SnQL for event queries
+  </Card>
+  <Card title="Query Optimization" icon="gauge-high" href="/query/optimization">
+    Optimize your MQL queries
+  </Card>
+</CardGroup>

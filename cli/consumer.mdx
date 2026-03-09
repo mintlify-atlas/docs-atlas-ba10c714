@@ -1,0 +1,602 @@
+---
+title: "Consumer Commands"
+description: "Process events from Kafka streams and write to ClickHouse storage"
+---
+
+## Overview
+
+Snuba provides two consumer implementations for processing events from Kafka and writing to ClickHouse:
+
+- **Python Consumer** - Original implementation with full Python-based message processing
+- **Rust Consumer** - High-performance implementation with Rust-based message processing
+
+Both consumers follow a similar architecture but with different performance characteristics. The Rust consumer is recommended for production workloads due to better throughput and resource efficiency.
+
+## Python Consumer
+
+The Python-based consumer provides flexible event processing with full Python message transformation.
+
+```bash
+snuba consumer [OPTIONS]
+```
+
+### Required Options
+
+<ParamField path="--storage" type="choice" required>
+  The storage to target for event processing. Must be a writable storage.
+  
+  Common values:
+  - `errors` - Error events
+  - `transactions` - Transaction events  
+  - `outcomes_raw` - Outcome/billing events
+  - `search_issues` - Issue occurrence events
+  - `replays` - Session replay events
+</ParamField>
+
+### Kafka Configuration
+
+<ParamField path="--raw-events-topic" type="string">
+  Topic to consume raw events from. If not specified, uses the default topic configured for the storage.
+</ParamField>
+
+<ParamField path="--consumer-group" type="string" default="snuba-consumers">
+  Consumer group ID for consuming the raw events topic. Used for offset management and load balancing.
+</ParamField>
+
+<ParamField path="--bootstrap-server" type="string" multiple>
+  Kafka bootstrap server(s) to use for consuming. Can be specified multiple times for multiple brokers.
+</ParamField>
+
+<ParamField path="--commit-log-topic" type="string">
+  Topic where committed offsets are written, triggering post-processing tasks.
+</ParamField>
+
+<ParamField path="--replacements-topic" type="string">
+  Topic to produce replacement messages for data updates/corrections.
+</ParamField>
+
+<ParamField path="--commit-log-bootstrap-server" type="string" multiple>
+  Kafka bootstrap server(s) for the commit log topic. Defaults to main bootstrap servers.
+</ParamField>
+
+<ParamField path="--replacement-bootstrap-server" type="string" multiple>
+  Kafka bootstrap server(s) for the replacements topic. Defaults to main bootstrap servers.
+</ParamField>
+
+### Batching Configuration
+
+<ParamField path="--max-batch-size" type="integer" default="50000">
+  Maximum number of messages to batch in memory.
+  
+  Batching applies to three stages:
+  1. Batching messages for processing (transforming into ClickHouse rows)
+  2. Batching for the INSERT statement
+  3. Batching of offset commits
+  
+  Commits are additionally debounced to happen at most once per second.
+</ParamField>
+
+<ParamField path="--max-batch-time-ms" type="integer" default="2000">
+  Maximum duration (in milliseconds) to buffer messages in memory before flushing.
+</ParamField>
+
+<ParamField path="--max-insert-batch-size" type="integer">
+  Maximum number of messages to batch for ClickHouse inserts. Defaults to `--max-batch-size` if not specified.
+</ParamField>
+
+<ParamField path="--max-insert-batch-time-ms" type="integer">
+  Maximum duration for batching ClickHouse inserts. Defaults to `--max-batch-time-ms` if not specified.
+</ParamField>
+
+### Consumer Behavior
+
+<ParamField path="--auto-offset-reset" type="choice" default="earliest">
+  Kafka consumer auto offset reset behavior.
+  
+  - `error` - Raise an error if no offset is found
+  - `earliest` - Start from the earliest offset
+  - `latest` - Start from the latest offset
+</ParamField>
+
+<ParamField path="--no-strict-offset-reset" type="flag">
+  Forces the Kafka consumer auto offset reset behavior, even when offsets already exist.
+</ParamField>
+
+<ParamField path="--queued-max-messages-kbytes" type="integer" default="50000">
+  Maximum kilobytes per topic+partition in the local consumer queue. Controls memory usage.
+</ParamField>
+
+<ParamField path="--queued-min-messages" type="integer" default="10000">
+  Minimum messages per topic+partition that librdkafka tries to maintain in the local queue.
+</ParamField>
+
+<ParamField path="--max-poll-interval-ms" type="integer" default="30000">
+  Maximum time between polls before the consumer is considered dead and triggers a rebalance.
+</ParamField>
+
+### Processing Configuration
+
+<ParamField path="--processes" type="integer">
+  Number of worker processes for parallel message processing. Increases throughput but also resource usage.
+</ParamField>
+
+<ParamField path="--input-block-size" type="integer">
+  Size of input blocks for processing pipeline.
+</ParamField>
+
+<ParamField path="--output-block-size" type="integer">
+  Size of output blocks for processing pipeline.
+</ParamField>
+
+<ParamField path="--enforce-schema" type="flag">
+  Enforce schema validation on the raw events topic. Rejects messages that don't match the expected schema.
+</ParamField>
+
+### Advanced Options
+
+<ParamField path="--slice-id" type="integer">
+  The slice ID for sliced storages. Used when a storage is partitioned across multiple consumers.
+</ParamField>
+
+<ParamField path="--join-timeout" type="integer" default="10">
+  Join timeout in seconds for graceful shutdown.
+</ParamField>
+
+<ParamField path="--profile-path" type="path">
+  Directory path for writing profiling data. Must be an existing directory.
+</ParamField>
+
+<ParamField path="--health-check-file" type="string">
+  Path to a file that Arroyo will touch at intervals to indicate health. Useful for orchestration systems like Kubernetes.
+</ParamField>
+
+<ParamField path="--group-instance-id" type="string">
+  Kafka group instance ID. Passing a value enables static membership for more stable consumer group behavior.
+</ParamField>
+
+<ParamField path="--quantized-rebalance-consumer-group-delay-secs" type="integer">
+  Time delay before a consumer starts rebalancing, used for coordinated rebalancing across pods during deployments.
+</ParamField>
+
+<ParamField path="--log-level" type="string">
+  Logging level to use (critical, error, warning, info, debug).
+</ParamField>
+
+### Examples
+
+<CodeGroup>
+```bash Basic Usage
+# Start consuming errors with default settings
+snuba consumer \
+  --storage errors \
+  --bootstrap-server kafka:9092
+```
+
+```bash Production Configuration
+# High-throughput consumer with optimized batching
+snuba consumer \
+  --storage transactions \
+  --bootstrap-server kafka1:9092 \
+  --bootstrap-server kafka2:9092 \
+  --consumer-group transactions_group \
+  --max-batch-size 100000 \
+  --max-batch-time-ms 3000 \
+  --processes 4 \
+  --log-level info
+```
+
+```bash Development Mode
+# Start from latest with debug logging
+snuba consumer \
+  --storage errors \
+  --bootstrap-server localhost:9092 \
+  --auto-offset-reset latest \
+  --no-strict-offset-reset \
+  --log-level debug
+```
+
+```bash With Health Checks
+# Configure health check for Kubernetes
+snuba consumer \
+  --storage outcomes_raw \
+  --consumer-group outcomes_group \
+  --bootstrap-server kafka:9092 \
+  --health-check-file /tmp/snuba-consumer-health
+```
+</CodeGroup>
+
+## Rust Consumer
+
+The Rust consumer is a high-performance alternative with better throughput and resource efficiency. It's the recommended choice for production workloads.
+
+```bash
+snuba rust-consumer [OPTIONS]
+```
+
+### Key Differences from Python Consumer
+
+- **Performance** - Significantly higher throughput (2-5x)
+- **Resource Usage** - Lower CPU and memory footprint
+- **Concurrency** - Better concurrent processing with configurable parallelism
+- **Schema Enforcement** - Built-in schema validation
+- **Multiple Storages** - Can target multiple storages in a single consumer
+
+### Required Options
+
+<ParamField path="--storage" type="choice" multiple required>
+  Storage(s) to target. Can be specified multiple times to process events for multiple storages.
+</ParamField>
+
+<ParamField path="--consumer-group" type="string" required>
+  Consumer group ID for offset management.
+</ParamField>
+
+### Core Configuration
+
+<ParamField path="--auto-offset-reset" type="choice" default="earliest">
+  Kafka consumer auto offset reset (error, earliest, latest).
+</ParamField>
+
+<ParamField path="--no-strict-offset-reset" type="flag">
+  Force the auto offset reset behavior.
+</ParamField>
+
+<ParamField path="--log-level" type="choice" default="info">
+  Logging level for Rust consumer.
+  
+  Available levels:
+  - `error` - Only errors
+  - `warn` - Warnings and errors
+  - `info` - Informational messages
+  - `debug` - Debug output
+  - `trace` - Verbose trace logging
+</ParamField>
+
+### Performance Options
+
+<ParamField path="--concurrency" type="integer" default="1">
+  Number of concurrent message processing tasks. Increases parallelism for message transformation.
+</ParamField>
+
+<ParamField path="--clickhouse-concurrency" type="integer" default="2">
+  Number of concurrent ClickHouse batch operations. Only increase this with `--async-inserts` enabled.
+</ParamField>
+
+<ParamField path="--async-inserts" type="flag">
+  Enable asynchronous inserts for ClickHouse. Improves throughput but requires proper ClickHouse configuration.
+</ParamField>
+
+<ParamField path="--use-rust-processor" type="flag" default="true">
+  Use the Rust message processor (if available) instead of Python. Generally faster.
+</ParamField>
+
+<ParamField path="--python-max-queue-depth" type="integer">
+  Maximum messages queued in the Python processor before backpressure. Defaults to number of processes.
+</ParamField>
+
+### Kafka Options
+
+<ParamField path="--bootstrap-server" type="string" multiple>
+  Kafka bootstrap servers (can be specified multiple times).
+</ParamField>
+
+<ParamField path="--raw-events-topic" type="string">
+  Topic to consume raw events from. Overrides the default for the storage.
+</ParamField>
+
+<ParamField path="--commit-log-topic" type="string">
+  Topic for committed offsets.
+</ParamField>
+
+<ParamField path="--replacements-topic" type="string">
+  Topic for replacement messages.
+</ParamField>
+
+<ParamField path="--commit-log-bootstrap-server" type="string" multiple>
+  Bootstrap servers for commit log topic.
+</ParamField>
+
+<ParamField path="--replacement-bootstrap-server" type="string" multiple>
+  Bootstrap servers for replacements topic.
+</ParamField>
+
+<ParamField path="--queued-max-messages-kbytes" type="integer" default="50000">
+  Maximum kilobytes per partition in local queue.
+</ParamField>
+
+<ParamField path="--queued-min-messages" type="integer" default="10000">
+  Minimum messages to maintain in local queue.
+</ParamField>
+
+<ParamField path="--max-poll-interval-ms" type="integer" default="30000">
+  Maximum time between polls before rebalance.
+</ParamField>
+
+### Batching Configuration
+
+<ParamField path="--max-batch-size" type="integer" default="50000">
+  Maximum messages to batch before writing to Kafka.
+</ParamField>
+
+<ParamField path="--max-batch-time-ms" type="integer" default="2000">
+  Maximum time to buffer messages before writing.
+</ParamField>
+
+<ParamField path="--batch-write-timeout-ms" type="integer">
+  Optional timeout for batch writer client connecting and sending to ClickHouse.
+</ParamField>
+
+### Reliability Options
+
+<ParamField path="--enforce-schema" type="flag">
+  Enforce schema validation on raw events topic.
+</ParamField>
+
+<ParamField path="--max-dlq-buffer-length" type="integer" default="25000">
+  Per-partition limit to the dead letter queue buffer length.
+</ParamField>
+
+<ParamField path="--health-check" type="choice" default="arroyo">
+  Health check implementation to use.
+  
+  - `arroyo` - Default Arroyo health check
+  - `snuba` - Snuba-specific health check
+</ParamField>
+
+<ParamField path="--health-check-file" type="string">
+  File to touch periodically to indicate health.
+</ParamField>
+
+### Advanced Options
+
+<ParamField path="--group-instance-id" type="string">
+  Kafka group instance ID for static membership.
+</ParamField>
+
+<ParamField path="--quantized-rebalance-consumer-group-delay-secs" type="integer">
+  Delay for quantized rebalancing during deployments.
+</ParamField>
+
+<ParamField path="--join-timeout-ms" type="integer" default="1000">
+  Milliseconds to wait for current batch to flush during rebalance.
+</ParamField>
+
+<ParamField path="--stop-at-timestamp" type="integer">
+  Unix timestamp after which to stop processing messages. Useful for bounded processing.
+</ParamField>
+
+<ParamField path="--use-row-binary" type="flag">
+  Use RowBinary format for ClickHouse inserts instead of JSONEachRow. Currently only supported for EAPItemsProcessor.
+</ParamField>
+
+### Examples
+
+<CodeGroup>
+```bash Basic Rust Consumer
+# Start consuming with Rust processor
+snuba rust-consumer \
+  --storage errors \
+  --consumer-group errors_group \
+  --bootstrap-server kafka:9092 \
+  --use-rust-processor
+```
+
+```bash High-Performance Configuration
+# Optimized for maximum throughput
+snuba rust-consumer \
+  --storage transactions \
+  --consumer-group transactions_group \
+  --bootstrap-server kafka:9092 \
+  --use-rust-processor \
+  --concurrency 8 \
+  --clickhouse-concurrency 4 \
+  --async-inserts \
+  --max-batch-size 100000 \
+  --max-batch-time-ms 5000
+```
+
+```bash Development Mode
+# Start from latest with debug logging
+snuba rust-consumer \
+  --storage errors \
+  --consumer-group dev_errors \
+  --bootstrap-server localhost:9092 \
+  --auto-offset-reset latest \
+  --no-strict-offset-reset \
+  --enforce-schema \
+  --log-level debug
+```
+
+```bash Multiple Storages
+# Process multiple storages in one consumer
+snuba rust-consumer \
+  --storage metrics_counters \
+  --storage metrics_sets \
+  --consumer-group metrics_group \
+  --bootstrap-server kafka:9092 \
+  --use-rust-processor
+```
+
+```bash With Health Checks
+# Kubernetes-ready configuration
+snuba rust-consumer \
+  --storage outcomes_raw \
+  --consumer-group outcomes_group \
+  --bootstrap-server kafka:9092 \
+  --health-check snuba \
+  --health-check-file /tmp/snuba-health \
+  --group-instance-id pod-1
+```
+</CodeGroup>
+
+## Consumer Architecture
+
+Both consumers follow a similar processing pipeline:
+
+<Steps>
+  <Step title="Consume from Kafka">
+    Messages are read from Kafka topics in batches based on configured batch size and time limits.
+  </Step>
+  
+  <Step title="Transform Messages">
+    Raw messages are processed and transformed into ClickHouse row format. This step can use either Python or Rust processors.
+  </Step>
+  
+  <Step title="Write to ClickHouse">
+    Transformed rows are batched and inserted into ClickHouse storage using bulk INSERT statements.
+  </Step>
+  
+  <Step title="Commit Offsets">
+    After successful writes, consumer offsets are committed back to Kafka.
+  </Step>
+  
+  <Step title="Post-Processing">
+    Committed offsets can trigger downstream processing tasks via the commit log topic.
+  </Step>
+</Steps>
+
+## Performance Tuning
+
+### Batch Size Optimization
+
+Larger batches improve throughput but increase latency and memory usage:
+
+```bash
+# Low latency (faster end-to-end, lower throughput)
+--max-batch-size 10000 --max-batch-time-ms 1000
+
+# Balanced
+--max-batch-size 50000 --max-batch-time-ms 2000
+
+# High throughput (higher latency, maximum throughput)
+--max-batch-size 100000 --max-batch-time-ms 5000
+```
+
+### Concurrency Settings
+
+For Rust consumers, tune concurrency based on CPU cores and workload:
+
+```bash
+# 8-core machine
+--concurrency 8 --clickhouse-concurrency 2
+
+# 16-core machine with async inserts
+--concurrency 16 --clickhouse-concurrency 4 --async-inserts
+```
+
+### Memory Management
+
+Control memory usage with queue size limits:
+
+```bash
+# Lower memory footprint
+--queued-max-messages-kbytes 25000 --queued-min-messages 5000
+
+# Higher throughput (more memory)
+--queued-max-messages-kbytes 100000 --queued-min-messages 20000
+```
+
+## Monitoring
+
+### Health Checks
+
+Enable health check files for monitoring:
+
+```bash
+snuba rust-consumer \
+  --storage errors \
+  --consumer-group errors_group \
+  --health-check-file /tmp/snuba-health
+
+# Check health
+test -f /tmp/snuba-health && echo "Healthy"
+```
+
+### Metrics
+
+Consumers emit metrics including:
+- Messages processed per second
+- Batch sizes and timing
+- ClickHouse insert latency
+- Consumer lag
+- Error rates
+
+### Logging
+
+Use appropriate log levels:
+
+```bash
+# Production - minimal logging
+--log-level info
+
+# Debugging issues
+--log-level debug
+
+# Deep troubleshooting (Rust only)
+--log-level trace
+```
+
+## Choosing Between Python and Rust Consumers
+
+<Accordion title="When to use Python Consumer">
+  - Debugging message processing logic
+  - Custom Python-based message processors
+  - Simpler deployment requirements
+  - Lower throughput workloads (under 10k msgs/sec)
+</Accordion>
+
+<Accordion title="When to use Rust Consumer">
+  - Production deployments
+  - High throughput requirements (over 10k msgs/sec)
+  - Need for better resource efficiency
+  - Built-in schema validation
+  - Most use cases should prefer Rust consumer
+</Accordion>
+
+## Common Issues
+
+<AccordionGroup>
+  <Accordion title="Consumer Lag Growing">
+    Increase concurrency and batch sizes:
+    ```bash
+    --concurrency 16 --max-batch-size 100000
+    ```
+    
+    Enable async inserts if available:
+    ```bash
+    --async-inserts --clickhouse-concurrency 4
+    ```
+  </Accordion>
+  
+  <Accordion title="High Memory Usage">
+    Reduce queue sizes:
+    ```bash
+    --queued-max-messages-kbytes 25000 \
+    --queued-min-messages 5000 \
+    --max-batch-size 25000
+    ```
+  </Accordion>
+  
+  <Accordion title="Rebalancing Too Frequently">
+    Increase poll interval:
+    ```bash
+    --max-poll-interval-ms 60000
+    ```
+    
+    Use static membership:
+    ```bash
+    --group-instance-id $(hostname)
+    ```
+  </Accordion>
+  
+  <Accordion title="Messages Being Skipped">
+    Check offset reset behavior:
+    ```bash
+    --auto-offset-reset earliest --no-strict-offset-reset
+    ```
+  </Accordion>
+</AccordionGroup>
+
+<Note>
+  Both consumers check ClickHouse connections on startup and will exit if unable to connect. Ensure ClickHouse is available before starting consumers.
+</Note>

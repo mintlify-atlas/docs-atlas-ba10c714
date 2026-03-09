@@ -1,0 +1,199 @@
+---
+title: API Overview
+description: Learn how to use Snuba's HTTP and Python APIs to query event data
+---
+
+Snuba provides two primary interfaces for querying data:
+
+1. **HTTP API** - REST endpoints for executing queries and managing subscriptions
+2. **Python API** - Direct programmatic access to datasets, query builders, and processors
+
+## Base URL
+
+The Snuba API is available at your Snuba instance:
+
+```
+http://localhost:1218
+```
+
+For production deployments, use your configured Snuba host.
+
+## Authentication
+
+Snuba queries require tenant identification through the request body:
+
+```json
+{
+  "tenant_ids": {
+    "organization_id": 1,
+    "referrer": "my-service"
+  }
+}
+```
+
+<ParamField path="tenant_ids.organization_id" type="integer" required>
+  The organization ID that owns the data being queried
+</ParamField>
+
+<ParamField path="tenant_ids.referrer" type="string" required>
+  Identifier for the service making the request (used for rate limiting and observability)
+</ParamField>
+
+## Query Languages
+
+Snuba supports two query languages:
+
+### SnQL (Snuba Query Language)
+
+SQL-like language optimized for event data:
+
+```sql
+MATCH (events)
+SELECT event_id, group_id, timestamp
+WHERE timestamp >= toDateTime('2024-01-01T00:00:00')
+  AND timestamp < toDateTime('2024-01-02T00:00:00')
+  AND project_id = 1
+```
+
+### MQL (Metrics Query Language)
+
+Specialized language for metrics aggregation:
+
+```
+sum(d:transactions/duration@millisecond){status_code:200}
+```
+
+## Error Handling
+
+Snuba returns structured error responses with appropriate HTTP status codes.
+
+### Error Response Format
+
+```json
+{
+  "error": {
+    "type": "invalid_query",
+    "message": "Query validation failed"
+  },
+  "timing": {
+    "timestamp": 1234567890,
+    "duration_ms": 150
+  }
+}
+```
+
+### Common Error Types
+
+<ResponseField name="error.type" type="string">
+  The error category:
+  - `invalid_query` - Query syntax or validation error
+  - `rate-limited` - Request exceeded rate limits
+  - `clickhouse` - Database error
+  - `storage-not-available` - Requested storage is not available
+  - `json` - JSON parsing error
+  - `schema` - Request schema validation error
+</ResponseField>
+
+### HTTP Status Codes
+
+| Status Code | Meaning |
+|-------------|----------|
+| 200 | Success |
+| 400 | Bad Request (invalid query, schema validation) |
+| 404 | Dataset/Entity not found |
+| 429 | Rate Limited |
+| 500 | Internal Server Error |
+| 503 | Service Unavailable (too many mutations) |
+
+## Rate Limiting
+
+Snuba implements allocation policies to manage query resources:
+
+- **Thread throttling** - Limits concurrent query threads
+- **Bytes scanned** - Limits data scanned per query
+- **Quota allowances** - Per-organization resource quotas
+
+Rate limit responses include quota information:
+
+```json
+{
+  "error": {
+    "type": "rate-limited",
+    "message": "Query cannot be run due to allocation policies"
+  },
+  "quota_allowance": {
+    "summary": {
+      "is_throttled": true,
+      "threads_used": 1,
+      "quota_used": 15000,
+      "quota_unit": "bytes",
+      "suggestion": "reduce query scope"
+    }
+  }
+}
+```
+
+## Caching
+
+Snuba automatically caches query results using Redis:
+
+- **Cache key** - Generated from query SQL
+- **Cache partitioning** - Results partitioned by storage
+- **Duplicate detection** - Concurrent identical queries share results
+
+Cache behavior is indicated in response stats:
+
+```json
+{
+  "stats": {
+    "cache_hit": 1,
+    "is_duplicate": 0
+  }
+}
+```
+
+## Consistency
+
+For queries requiring strong consistency, set the `consistent` flag:
+
+```json
+{
+  "query": "...",
+  "consistent": true
+}
+```
+
+This forces queries to use the first shard replica with synchronous writes.
+
+## Debugging
+
+Enable debug mode to include detailed stats in responses:
+
+```json
+{
+  "query": "...",
+  "debug": true
+}
+```
+
+Debug responses include:
+- Query execution stats
+- Clickhouse query settings
+- SQL generated
+- Timing breakdown
+- Cache status
+- Allocation policy details
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Query API" icon="search" href="/api/query">
+    Execute SnQL and MQL queries
+  </Card>
+  <Card title="Subscriptions" icon="bell" href="/api/subscriptions">
+    Create recurring query subscriptions
+  </Card>
+  <Card title="Python API" icon="code" href="/api/python/datasets">
+    Use Snuba programmatically
+  </Card>
+</CardGroup>

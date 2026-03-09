@@ -1,0 +1,693 @@
+---
+title: Deployment
+description: Deploy Snuba using Docker or Kubernetes with production-ready configurations
+---
+
+Snuba supports multiple deployment strategies, from local Docker environments to production Kubernetes clusters. This guide covers deployment configurations, best practices, and operational considerations.
+
+## Docker Deployment
+
+### Building the Docker Image
+
+Snuba uses a multi-stage Dockerfile optimized for production use with both standard and distroless variants.
+
+```dockerfile
+# Standard production image
+docker build --target application -t snuba:latest .
+
+# Distroless production image (smaller attack surface)
+docker build --target application-distroless -t snuba:distroless .
+
+# Distroless debug image (includes busybox tools)
+docker build --target application-distroless-debug -t snuba:distroless-debug .
+```
+
+<Note>
+The Dockerfile uses Python 3.13, UV for dependency management, and includes Rust components built with Maturin. Build times can be significant due to Rust compilation.
+</Note>
+
+### Image Variants
+
+Snuba provides three production image variants:
+
+<Accordion title="Standard Application Image">
+The default production image includes a full Debian base with debugging tools:
+
+- **Base**: Python 3.13 on Debian Trixie
+- **Tools**: gdb, heaptrack, curl
+- **User**: Non-root user `snuba` (UID 1000)
+- **Ports**: 1218 (API), 1219 (Admin)
+- **Memory**: Uses jemalloc for better memory management
+
+```bash
+docker run -p 1218:1218 -p 1219:1219 \
+  -e CLICKHOUSE_HOST=clickhouse \
+  -e REDIS_HOST=redis \
+  -e DEFAULT_BROKERS=kafka:9092 \
+  snuba:latest api
+```
+</Accordion>
+
+<Accordion title="Distroless Image">
+Minimal production image with reduced attack surface:
+
+- **Base**: Google Distroless Python 3
+- **Size**: Significantly smaller than standard image
+- **Security**: No shell, no package manager
+- **Trade-off**: Harder to debug in production
+
+```bash
+docker run -p 1218:1218 \
+  -e CLICKHOUSE_HOST=clickhouse \
+  snuba:distroless api
+```
+</Accordion>
+
+<Accordion title="Distroless Debug Image">
+Distroless with busybox for basic debugging:
+
+- **Includes**: sh, ls, cat, wget, env
+- **Use case**: Production debugging when needed
+- **Security**: Better than full image, more accessible than pure distroless
+</Accordion>
+
+### Docker Compose Setup
+
+For testing and development, use Docker Compose with the required dependencies:
+
+```yaml
+version: "3.4"
+
+services:
+  snuba-api:
+    image: snuba:latest
+    command: api
+    ports:
+      - "1218:1218"
+    environment:
+      SNUBA_SETTINGS: docker
+      CLICKHOUSE_HOST: clickhouse
+      REDIS_HOST: redis
+      DEFAULT_BROKERS: kafka:9092
+    depends_on:
+      - clickhouse
+      - redis
+      - kafka
+
+  snuba-consumer:
+    image: snuba:latest
+    command: >
+      consumer --storage=errors
+      --consumer-group=snuba-consumers
+      --auto-offset-reset=latest
+      --max-batch-size=50000
+    environment:
+      SNUBA_SETTINGS: docker
+      CLICKHOUSE_HOST: clickhouse
+      DEFAULT_BROKERS: kafka:9092
+    depends_on:
+      - clickhouse
+      - kafka
+
+  clickhouse:
+    image: altinity/clickhouse-server:25.3.6.10034.altinitystable
+    ports:
+      - "9000:9000"
+      - "8123:8123"
+    volumes:
+      - ./config/clickhouse/macros.xml:/etc/clickhouse-server/config.d/macros.xml
+      - ./config/clickhouse/zookeeper.xml:/etc/clickhouse-server/config.d/zookeeper.xml
+      - ./config/clickhouse/remote_servers.xml:/etc/clickhouse-server/config.d/remote_servers.xml
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+
+  kafka:
+    image: confluentinc/cp-kafka:6.2.0
+    environment:
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:6.2.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+```
+
+### Environment Variables
+
+Key environment variables for Docker deployment:
+
+```bash
+# ClickHouse Configuration
+CLICKHOUSE_HOST=127.0.0.1
+CLICKHOUSE_PORT=9000
+CLICKHOUSE_HTTP_PORT=8123
+CLICKHOUSE_USER=default
+CLICKHOUSE_PASSWORD=
+CLICKHOUSE_DATABASE=default
+
+# Redis Configuration
+REDIS_HOST=127.0.0.1
+REDIS_PORT=6379
+REDIS_DB=1
+USE_REDIS_CLUSTER=0
+
+# Kafka Configuration
+DEFAULT_BROKERS=127.0.0.1:9092
+
+# Application Settings
+SNUBA_SETTINGS=docker
+LOG_LEVEL=INFO
+SNUBA_RELEASE=${SOURCE_COMMIT}
+
+# API Workers
+API_WORKERS=1
+API_THREADS=1
+
+# Performance
+LD_PRELOAD=/usr/src/snuba/libjemalloc.so.2
+PYTHONUNBUFFERED=1
+FLASK_DEBUG=0
+```
+
+## Kubernetes Deployment
+
+### Deployment Architecture
+
+Snuba on Kubernetes requires multiple components:
+
+<Steps>
+
+<Step title="Deploy ClickHouse">
+Deploy ClickHouse as a StatefulSet with persistent volumes:
+
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: clickhouse
+spec:
+  serviceName: clickhouse
+  replicas: 3
+  selector:
+    matchLabels:
+      app: clickhouse
+  template:
+    metadata:
+      labels:
+        app: clickhouse
+    spec:
+      containers:
+      - name: clickhouse
+        image: altinity/clickhouse-server:25.3.6.10034.altinitystable
+        ports:
+        - containerPort: 9000
+          name: native
+        - containerPort: 8123
+          name: http
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/clickhouse
+        - name: config
+          mountPath: /etc/clickhouse-server/config.d
+        resources:
+          requests:
+            memory: "4Gi"
+            cpu: "2"
+          limits:
+            memory: "8Gi"
+            cpu: "4"
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 100Gi
+```
+</Step>
+
+<Step title="Deploy Snuba API">
+Deploy the Snuba API as a Deployment with horizontal scaling:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: snuba-api
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: snuba
+      component: api
+  template:
+    metadata:
+      labels:
+        app: snuba
+        component: api
+    spec:
+      containers:
+      - name: api
+        image: us-docker.pkg.dev/sentryio/snuba/image:latest
+        command: ["snuba", "api"]
+        ports:
+        - containerPort: 1218
+          name: http
+        env:
+        - name: SNUBA_SETTINGS
+          value: "production"
+        - name: CLICKHOUSE_HOST
+          value: "clickhouse"
+        - name: REDIS_HOST
+          value: "redis"
+        - name: DEFAULT_BROKERS
+          value: "kafka:9092"
+        - name: API_WORKERS
+          value: "4"
+        - name: API_THREADS
+          value: "8"
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "500m"
+          limits:
+            memory: "2Gi"
+            cpu: "2"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 1218
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 1218
+          initialDelaySeconds: 10
+          periodSeconds: 5
+```
+</Step>
+
+<Step title="Deploy Consumers">
+Deploy consumers as separate Deployments for each storage:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: snuba-consumer-errors
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: snuba
+      component: consumer
+      storage: errors
+  template:
+    metadata:
+      labels:
+        app: snuba
+        component: consumer
+        storage: errors
+    spec:
+      containers:
+      - name: consumer
+        image: us-docker.pkg.dev/sentryio/snuba/image:latest
+        command:
+        - snuba
+        - consumer
+        - --storage=errors
+        - --consumer-group=snuba-consumers
+        - --auto-offset-reset=latest
+        - --max-batch-size=50000
+        - --max-batch-time-ms=2000
+        - --processes=2
+        - --health-check-file=/tmp/health.txt
+        env:
+        - name: SNUBA_SETTINGS
+          value: "production"
+        - name: CLICKHOUSE_HOST
+          value: "clickhouse"
+        - name: DEFAULT_BROKERS
+          value: "kafka:9092"
+        resources:
+          requests:
+            memory: "1Gi"
+            cpu: "1"
+          limits:
+            memory: "4Gi"
+            cpu: "4"
+        livenessProbe:
+          exec:
+            command:
+            - cat
+            - /tmp/health.txt
+          initialDelaySeconds: 60
+          periodSeconds: 30
+```
+</Step>
+
+<Step title="Deploy Admin UI">
+Deploy the admin interface:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: snuba-admin
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: snuba
+      component: admin
+  template:
+    metadata:
+      labels:
+        app: snuba
+        component: admin
+    spec:
+      containers:
+      - name: admin
+        image: us-docker.pkg.dev/sentryio/snuba/image:latest
+        command: ["snuba", "admin"]
+        ports:
+        - containerPort: 1219
+          name: http
+        env:
+        - name: SNUBA_SETTINGS
+          value: "production"
+        - name: ADMIN_HOST
+          value: "0.0.0.0"
+        - name: ADMIN_PORT
+          value: "1219"
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "1"
+```
+</Step>
+
+</Steps>
+
+### Production Deployment with k8s-deploy
+
+Sentry uses a custom `k8s-deploy` tool for rolling updates:
+
+```bash
+#!/bin/bash
+# Production deployment script
+
+k8s-deploy \
+  --label-selector="app=snuba" \
+  --image="us-docker.pkg.dev/sentryio/snuba/image:${VERSION}" \
+  --container-name="api" \
+  --container-name="dlq-consumer" \
+  --container-name="events-subscriptions-executor" \
+  --container-name="events-subscriptions-scheduler" \
+  --container-name="transactions-subscriptions-executor" \
+  --container-name="search-issues-consumer" \
+  --container-name="snuba-admin"
+
+# Deploy CronJobs separately
+k8s-deploy \
+  --label-selector="app=snuba" \
+  --image="us-docker.pkg.dev/sentryio/snuba/image:${VERSION}" \
+  --type="cronjob" \
+  --container-name="optimize" \
+  --container-name="cleanup"
+```
+
+## Running Migrations
+
+<Warning>
+Always run migrations before deploying new code versions. Failed migrations can cause service disruptions.
+</Warning>
+
+Migrations must be run before deploying updated Snuba versions:
+
+### Check Migration Status
+
+```bash
+# List all migrations and their status
+snuba migrations list
+
+# Output:
+# events (readiness_state: complete)
+# [X]  0001_events_initial
+# [X]  0002_events_onpremise_compatibility
+# [ ]  0003_errors (blocking)
+```
+
+### Run Migrations
+
+```bash
+# Run all pending migrations
+snuba migrations migrate --force
+
+# Run migrations for a specific group
+snuba migrations migrate --group=events --force
+
+# Run a specific migration
+snuba migrations run --group=events --migration-id=0003_errors --force
+
+# Dry run to preview changes
+snuba migrations run --group=events --migration-id=0003_errors --dry-run
+```
+
+<Accordion title="Migration Groups">
+Snuba organizes migrations by storage group:
+
+- **events**: Core events and errors data
+- **transactions**: Transaction and performance data
+- **outcomes**: Event outcome tracking
+- **sessions**: Release health data
+- **metrics**: DDM and metrics data
+- **discover**: Cross-dataset discover queries
+- **replays**: Session replay data
+- **profiles**: Profiling data
+- **generic_metrics**: Generic metrics infrastructure
+</Accordion>
+
+### Kubernetes Migration Job
+
+Run migrations as a Kubernetes Job:
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: snuba-migrate
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: migrate
+        image: us-docker.pkg.dev/sentryio/snuba/image:latest
+        command:
+        - snuba
+        - migrations
+        - migrate
+        - --force
+        env:
+        - name: SNUBA_SETTINGS
+          value: "production"
+        - name: CLICKHOUSE_HOST
+          value: "clickhouse"
+      backoffLimit: 3
+```
+
+## Service Configuration
+
+### Services and Ports
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: snuba-api
+spec:
+  selector:
+    app: snuba
+    component: api
+  ports:
+  - port: 1218
+    targetPort: 1218
+    name: http
+  type: ClusterIP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: snuba-admin
+spec:
+  selector:
+    app: snuba
+    component: admin
+  ports:
+  - port: 1219
+    targetPort: 1219
+    name: http
+  type: ClusterIP
+```
+
+### Ingress Configuration
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: snuba-ingress
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+spec:
+  rules:
+  - host: snuba.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: snuba-api
+            port:
+              number: 1218
+  - host: snuba-admin.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: snuba-admin
+            port:
+              number: 1219
+```
+
+## Health Checks
+
+Snuba provides two health check endpoints:
+
+### Basic Health Check
+
+```bash
+curl http://localhost:1218/health
+
+# Response:
+{
+  "status": "ok",
+  "down_file_exists": false
+}
+```
+
+### Thorough Health Check
+
+Verifies all ClickHouse tables are accessible:
+
+```bash
+curl http://localhost:1218/health?thorough=true
+
+# Response:
+{
+  "status": "ok",
+  "down_file_exists": false,
+  "clickhouse_ok": true
+}
+```
+
+### Envoy Health Check
+
+For load balancer integration:
+
+```bash
+curl http://localhost:1218/health_envoy
+```
+
+<Note>
+The health check can be configured to ignore ClickHouse status using the runtime config: `health_check_ignore_clickhouse=1`
+</Note>
+
+## Graceful Shutdown
+
+Snuba supports graceful shutdown for zero-downtime deployments:
+
+```bash
+# Create shutdown marker file
+touch /tmp/snuba.down
+
+# Health checks will start failing, allowing load balancers to drain traffic
+# Wait for existing requests to complete (typically 30-60 seconds)
+
+# Then send SIGTERM to stop the process
+kill -TERM <snuba-pid>
+```
+
+## Best Practices
+
+<Warning>
+**Critical Deployment Checklist**
+- Always run migrations before deploying code
+- Test migrations in staging first
+- Monitor error rates during rollout
+- Keep at least 2 API replicas for high availability
+- Use separate consumer groups for different environments
+</Warning>
+
+1. **Resource Sizing**: Start with 2 CPU cores and 4GB RAM per API pod, adjust based on load
+2. **Consumer Scaling**: Scale consumers based on Kafka lag, not CPU usage
+3. **Health Checks**: Use thorough health checks for readiness, basic for liveness
+4. **Rolling Updates**: Set `maxUnavailable: 1` and `maxSurge: 1` for safe rollouts
+5. **Monitoring**: Always deploy with DataDog or Prometheus monitoring enabled
+6. **Secret Management**: Use Kubernetes secrets for ClickHouse and Redis credentials
+7. **Network Policies**: Restrict traffic between pods using NetworkPolicies
+8. **Pod Disruption Budgets**: Set `minAvailable: 1` for API pods
+
+## Troubleshooting
+
+### Container Won't Start
+
+```bash
+# Check logs
+kubectl logs -f snuba-api-<pod-id>
+
+# Common issues:
+# - Cannot connect to ClickHouse: Check CLICKHOUSE_HOST
+# - Cannot connect to Redis: Check REDIS_HOST
+# - Migration not applied: Run migrations first
+```
+
+### High Memory Usage
+
+```bash
+# Enable heaptrack profiling
+export ENABLE_HEAPTRACK=1
+snuba api
+
+# Profile data will be written to ./profiler_data/
+```
+
+### Connection Timeouts
+
+```bash
+# Increase timeouts in deployment
+env:
+- name: CLICKHOUSE_MAX_CONNECTIONS
+  value: "10"
+- name: CLICKHOUSE_BLOCK_CONNECTIONS
+  value: "false"
+```

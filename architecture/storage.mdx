@@ -1,0 +1,463 @@
+---
+title: "Storage Layer"
+description: "ClickHouse-backed storage implementation and table engines"
+---
+
+Snuba's storage layer is built on ClickHouse, a columnar database optimized for analytical queries on time-series data. This architecture provides the real-time performance and scalability required for Sentry's query infrastructure.
+
+## Why ClickHouse?
+
+ClickHouse was selected as Snuba's backing storage for several key reasons:
+
+<CardGroup cols={2}>
+  <Card title="Real-Time Performance" icon="gauge-high">
+    Fast query execution on large datasets with columnar storage
+  </Card>
+  <Card title="Distributed Architecture" icon="network-wired">
+    Built-in sharding and replication for horizontal scaling
+  </Card>
+  <Card title="Flexible Storage Engines" icon="gears">
+    Multiple table engines for different consistency/performance tradeoffs
+  </Card>
+  <Card title="SQL Interface" icon="code">
+    Familiar query language with powerful extensions
+  </Card>
+</CardGroup>
+
+## ClickHouse Cluster Architecture
+
+Snuba manages connections to ClickHouse through cluster abstractions:
+
+```python
+# From snuba/clusters/cluster.py
+class ClickhouseCluster:
+    """
+    Provides reader, writer and ClickHouse connections shared by all 
+    storages on the cluster.
+    """
+    
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        database: str,
+        http_port: int,
+        storage_sets: Set[str],
+        single_node: bool,
+        cluster_name: Optional[str] = None,
+        distributed_cluster_name: Optional[str] = None,
+    ):
+        self.__query_node = ClickhouseNode(host, port)
+        self.__database = database
+        self.__single_node = single_node
+        self.__cluster_name = cluster_name
+```
+
+### Cluster Types
+
+#### Single Node Cluster
+
+- One ClickHouse server instance
+- Simplified operations and migrations
+- No distributed tables required
+- Suitable for development and small deployments
+
+#### Multi-Node Cluster
+
+- Multiple shards and replicas
+- Requires `cluster_name` for local tables
+- Requires `distributed_cluster_name` for distributed tables
+- Enables horizontal scaling
+
+<Note>
+  A single proxy address is used for all read/write operations, but DDL operations must run on each individual node.
+</Note>
+
+### Cluster Configuration
+
+Clusters are defined in `settings.py`:
+
+```python
+CLUSTERS = [
+    {
+        "host": "clickhouse-server",
+        "port": 9000,
+        "http_port": 8123,
+        "user": "default",
+        "password": "",
+        "database": "default",
+        "storage_sets": {"events", "transactions"},
+        "single_node": False,
+        "cluster_name": "cluster_one_sh",
+        "distributed_cluster_name": "cluster_one_sh_dist",
+    }
+]
+```
+
+## Table Structure
+
+### Local vs Distributed Tables
+
+In multi-node deployments, Snuba creates two types of tables:
+
+#### Local Tables
+
+- Suffix: `_local`
+- Physical storage on each shard
+- Data written directly here
+- Contains actual data files
+
+```sql
+-- Example: errors_local table
+CREATE TABLE IF NOT EXISTS errors_local
+(
+    project_id UInt64,
+    timestamp DateTime,
+    event_id UUID,
+    platform String,
+    message String,
+    -- ... more columns
+)
+ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/{shard}/errors_local', '{replica}')
+PARTITION BY (retention_days, toMonday(timestamp))
+ORDER BY (project_id, toStartOfDay(timestamp), event_id)
+SAMPLE BY cityHash64(event_id)
+```
+
+#### Distributed Tables
+
+- Suffix: `_dist`
+- Virtual table that routes queries to local tables
+- Queries distributed across all shards
+- No data stored locally
+
+```sql
+-- Example: errors_dist distributed table
+CREATE TABLE IF NOT EXISTS errors_dist
+AS errors_local
+ENGINE = Distributed('cluster_one_sh', default, errors_local, cityHash64(event_id))
+```
+
+<Info>
+  Single-node deployments only create local tables. Distributed tables are unnecessary overhead.
+</Info>
+
+## Table Engines
+
+ClickHouse provides multiple table engines. Snuba primarily uses these:
+
+### ReplicatedReplacingMergeTree
+
+Most common engine for Snuba tables:
+
+```sql
+ENGINE = ReplicatedReplacingMergeTree(
+    '/clickhouse/tables/{shard}/errors_local',  -- ZooKeeper path
+    '{replica}',                                  -- Replica name
+    deleted                                       -- Version column
+)
+```
+
+**Features**:
+- **Replication**: Automatic data replication via ZooKeeper
+- **Deduplication**: Removes duplicate rows with same primary key
+- **Replacement**: Keeps row with highest version column value
+- **Eventual consistency**: Deduplication happens during merges
+
+**Use case**: Primary storage for events, transactions, errors
+
+<Warning>
+  ReplacingMergeTree deduplication is not guaranteed until merge. Use FINAL modifier for guaranteed deduplication (at performance cost).
+</Warning>
+
+### ReplicatedMergeTree
+
+Basic replicated storage without deduplication:
+
+```sql
+ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/table', '{replica}')
+```
+
+**Features**:
+- Replication via ZooKeeper
+- No automatic deduplication
+- Faster inserts than ReplacingMergeTree
+
+**Use case**: Data where duplicates are acceptable or handled upstream
+
+### ReplicatedAggregatingMergeTree
+
+Pre-aggregates data during merges:
+
+```sql
+ENGINE = ReplicatedAggregatingMergeTree('/clickhouse/tables/{shard}/table', '{replica}')
+```
+
+**Features**:
+- Stores intermediate aggregation states
+- Combines states during merges
+- Requires AggregateFunction column types
+
+**Use case**: Metrics pre-aggregations, materialized views
+
+### Materialized Views
+
+Creates derived tables that auto-update:
+
+```sql
+CREATE MATERIALIZED VIEW outcomes_hourly_mv
+TO outcomes_hourly_local
+AS
+SELECT
+    toStartOfHour(timestamp) as hour,
+    project_id,
+    outcome,
+    count() as count
+FROM outcomes_raw_local
+GROUP BY hour, project_id, outcome
+```
+
+**Use case**: Pre-aggregated views for faster queries
+
+## Storage Schema
+
+Snuba storages are defined in YAML configuration:
+
+```yaml
+# From snuba/datasets/configuration/events/storages/errors.yaml
+version: v1
+kind: writable_storage
+name: errors
+storage:
+  key: errors
+  set_key: events  # Cluster mapping
+schema:
+  columns:
+    - { name: project_id, type: UInt, args: { size: 64 } }
+    - { name: timestamp, type: DateTime }
+    - { name: event_id, type: UUID }
+    - { name: tags, type: Nested, args: {
+        subcolumns: [
+          { name: key, type: String },
+          { name: value, type: String }
+        ]
+      }}
+  local_table_name: errors_local
+  dist_table_name: errors_dist
+  partition_format:
+    - retention_days
+    - date
+```
+
+### Key Schema Elements
+
+#### Partition Format
+
+Defines how data is partitioned on disk:
+
+```yaml
+partition_format:
+  - retention_days    # Data retention partition
+  - date              # Time-based partition
+```
+
+**Benefits**:
+- Efficient data deletion (drop entire partitions)
+- Pruning irrelevant partitions during queries
+- Parallel processing across partitions
+
+#### Order By / Primary Key
+
+Defines sort order and primary key (from DDL):
+
+```sql
+ORDER BY (project_id, toStartOfDay(timestamp), event_id)
+```
+
+**Impact**:
+- Determines data locality on disk
+- Enables efficient range scans
+- Critical for query performance
+
+<Note>
+  Choose ORDER BY columns based on most common query patterns. First columns should be most selective.
+</Note>
+
+## Data Types
+
+Snuba uses ClickHouse's rich type system:
+
+### Primitive Types
+
+```yaml
+columns:
+  - { name: project_id, type: UInt, args: { size: 64 } }  # UInt64
+  - { name: timestamp, type: DateTime }                    # DateTime
+  - { name: event_id, type: UUID }                         # UUID
+  - { name: message, type: String }                        # String
+  - { name: retention_days, type: UInt, args: { size: 16 } }  # UInt16
+```
+
+### Complex Types
+
+#### Nested
+
+Stores arrays of structs:
+
+```yaml
+- name: tags
+  type: Nested
+  args:
+    subcolumns:
+      - { name: key, type: String }
+      - { name: value, type: String }
+```
+
+Stored as parallel arrays: `tags.key` and `tags.value`
+
+#### Array
+
+Homogeneous arrays:
+
+```yaml
+- name: sdk_integrations
+  type: Array
+  args:
+    inner_type: { type: String }
+```
+
+#### Nullable
+
+Allows NULL values (use sparingly):
+
+```yaml
+- name: user_id
+  type: String
+  args:
+    schema_modifiers: [nullable]
+```
+
+<Warning>
+  Nullable columns have performance overhead. Use empty strings or zero values instead when possible.
+</Warning>
+
+## Connection Management
+
+Snuba maintains connection pools for efficiency:
+
+```python
+class ConnectionCache:
+    """Caches ClickHouse connection pools per configuration"""
+    
+    def get_node_connection(
+        self,
+        client_settings: ClickhouseClientSettings,
+        node: ClickhouseNode,
+        user: str,
+        password: str,
+        database: str,
+    ) -> ClickhousePool:
+        # Reuse existing connection or create new one
+        cache_key = (node, client_settings, user, password, database)
+        if cache_key not in self.__cache:
+            self.__cache[cache_key] = ClickhousePool(
+                node.host_name,
+                node.port,
+                user,
+                password,
+                database,
+                client_settings=settings,
+            )
+        return self.__cache[cache_key]
+```
+
+### Client Settings
+
+Different operations use different ClickHouse settings:
+
+```python
+class ClickhouseClientSettings(Enum):
+    QUERY = ClickhouseClientSettingsType({}, None)
+    INSERT = ClickhouseClientSettingsType({}, None)
+    MIGRATE = ClickhouseClientSettingsType({
+        "replication_alter_partitions_sync": 2,
+        "mutations_sync": 2,
+        "alter_sync": 2,
+    }, 300000)  # 5 minute timeout
+    DELETE = ClickhouseClientSettingsType({"mutations_sync": 1}, None)
+    REPLACE = ClickhouseClientSettingsType({
+        "max_block_size": 8192,
+        "max_memory_usage": 10_000_000_000,
+    }, None)
+```
+
+## Batch Writing
+
+Snuba writes to ClickHouse in batches for efficiency:
+
+```python
+class HTTPBatchWriter(BatchWriter[JSONRow]):
+    """Batches JSON rows and sends via HTTP to ClickHouse"""
+    
+    def write(self, rows: Iterable[JSONRow]) -> None:
+        # Format rows as JSON or native format
+        # Send to ClickHouse HTTP endpoint
+        # Handle retries and errors
+```
+
+**Batch Configuration**:
+- **Chunk size**: Number of rows per HTTP request
+- **Buffer size**: Memory buffer for accumulating rows
+- **Max connections**: Connection pool size
+
+## Storage Sets
+
+Storages are grouped into **Storage Sets** that share a cluster:
+
+```python
+# From snuba/clusters/storage_sets.py
+class StorageSetKey(Enum):
+    EVENTS = "events"
+    TRANSACTIONS = "transactions" 
+    METRICS = "metrics"
+    SESSIONS = "sessions"
+    OUTCOMES = "outcomes"
+```
+
+**Purpose**:
+- Co-locate related storages on same cluster
+- Share connection pools and resources
+- Enable cross-storage optimizations
+
+## Performance Considerations
+
+### Query Optimization
+
+1. **PREWHERE clause**: Filter before reading all columns
+2. **Index usage**: Leverage ORDER BY for range scans
+3. **Partition pruning**: Filter by partition key columns
+4. **Sampling**: Use SAMPLE clause for approximate queries
+
+### Write Optimization
+
+1. **Batch inserts**: Write thousands of rows per request
+2. **Partition alignment**: Respect partition boundaries
+3. **Deduplication**: Rely on ReplacingMergeTree, not application
+
+### Storage Optimization
+
+1. **Compression**: ClickHouse compresses data automatically
+2. **Materialized views**: Pre-aggregate common queries
+3. **TTL policies**: Auto-delete old partitions
+4. **Column selection**: Only include necessary columns
+
+<Info>
+  ClickHouse's columnar storage means queries only read columns they need. Add columns liberally without significant cost.
+</Info>
+
+## Related Topics
+
+- [Data Model](/architecture/data-model) - Understanding Storages in the data model
+- [Ingestion](/architecture/ingestion) - How data is written to storage
+- [Query Processing](/architecture/query-processing) - How storage is queried
+- [Slicing](/architecture/slicing) - Multi-tenant storage configuration

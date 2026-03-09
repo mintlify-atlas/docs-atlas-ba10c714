@@ -1,97 +1,102 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "Snuba Documentation"
+description: "A time-series data platform built on ClickHouse with fast ingestion, query optimization, and a rich data model"
 ---
 
-## Setting up
+<Note>
+  Snuba is a service that provides a rich data model on top of ClickHouse together with a fast ingestion consumer and a query optimizer.
+</Note>
 
-Get your documentation site up and running in minutes.
+## What is Snuba?
 
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
+Snuba is a time-series oriented data platform backed by ClickHouse, designed to power analytics and metrics for Sentry. It provides a sophisticated query layer with custom query languages (SnQL and MQL), optimized data ingestion from Kafka, and advanced features like subscriptions and migrations.
 
-## Make it yours
+Originally developed to replace a combination of Postgres and Redis for searching and aggregating Sentry error data, Snuba has evolved to support multiple datasets and power most time-series related features across the Sentry platform.
 
-Design a docs site that looks great and empowers your users.
+## Key Features
 
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="ClickHouse Integration" icon="database" href="/architecture/storage">
+    Database access layer to the ClickHouse distributed data store with optimized storage engines
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Query Languages" icon="code" href="/query/overview">
+    SnQL and MQL provide graph logical data model queries with SQL-like functionality
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Multi-Dataset Support" icon="layer-group" href="/datasets/overview">
+    Support multiple independent datasets in a single installation (events, transactions, metrics, etc.)
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="Query Optimizer" icon="gauge-high" href="/query/optimization">
+    Rule-based query optimizer for efficient ClickHouse query execution
   </Card>
-</Columns>
+  <Card title="Kafka Ingestion" icon="stream" href="/architecture/ingestion">
+    Direct data ingestion from Kafka with a flexible consumer framework
+  </Card>
+  <Card title="Migration System" icon="code-merge" href="/migrations/overview">
+    DDL migration system for single-node and distributed ClickHouse environments
+  </Card>
+  <Card title="Subscriptions" icon="bell" href="/api/subscriptions">
+    Streaming queries for real-time alerts and continuous data monitoring
+  </Card>
+  <Card title="Admin Interface" icon="gauge" href="/cli/admin">
+    Web-based admin interface for managing queries, migrations, and system state
+  </Card>
+</CardGroup>
 
-## Create beautiful pages
+## Quick Start
 
-Everything you need to create world-class documentation.
+<CardGroup cols={2}>
+  <Card title="Get Started" icon="rocket" href="/quickstart">
+    Set up Snuba and run your first query in minutes
+  </Card>
+  <Card title="Installation" icon="download" href="/installation">
+    Install and configure Snuba for your environment
+  </Card>
+  <Card title="Architecture Overview" icon="sitemap" href="/architecture/overview">
+    Understand how Snuba works under the hood
+  </Card>
+  <Card title="CLI Reference" icon="terminal" href="/cli/overview">
+    Explore available CLI commands for operations
+  </Card>
+</CardGroup>
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+## Main Components
 
-## Need inspiration?
+### Data Model
+Snuba organizes data into **Datasets**, which represent independent partitions of the data model. Each dataset contains one or more **Entities** (query-level abstractions) mapped to **Storages** (physical ClickHouse tables).
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+### Query Processing
+Queries are expressed in SnQL or MQL and go through a sophisticated processing pipeline that includes parsing, validation, optimization, and translation to ClickHouse SQL.
+
+### Ingestion Pipeline
+Data flows from Kafka topics through specialized consumers that process messages and write batches to ClickHouse tables, supporting both real-time ingestion and eventual consistency.
+
+## Use Cases
+
+<AccordionGroup>
+  <Accordion title="Error and Event Analytics">
+    The `events` dataset powers issue search, filtering, and aggregations in Sentry's error tracking features.
+  </Accordion>
+  <Accordion title="Performance Monitoring">
+    The `transactions` dataset supports all performance monitoring features with distributed tracing data.
+  </Accordion>
+  <Accordion title="Metrics and Aggregations">
+    The `metrics` and `generic_metrics` datasets handle high-volume pre-aggregated metrics data.
+  </Accordion>
+  <Accordion title="Release Health">
+    The `sessions` dataset ingests high-volume session data with pre-aggregation for release health tracking.
+  </Accordion>
+  <Accordion title="Usage Statistics">
+    The `outcomes` dataset powers the Sentry stats page with billing and usage information.
+  </Accordion>
+</AccordionGroup>
+
+## Resources
+
+<CardGroup cols={2}>
+  <Card title="GitHub Repository" icon="github" href="https://github.com/getsentry/snuba">
+    View source code and contribute to Snuba
+  </Card>
+  <Card title="API Reference" icon="book" href="/api/overview">
+    Explore HTTP endpoints and Python API
+  </Card>
+</CardGroup>

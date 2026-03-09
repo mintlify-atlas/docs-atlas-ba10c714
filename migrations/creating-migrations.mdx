@@ -1,0 +1,728 @@
+---
+title: Creating Migrations
+description: Step-by-step guide to writing Snuba migrations for ClickHouse schema changes
+---
+
+## Overview
+
+This guide covers how to create migrations in Snuba, from auto-generation for simple changes to writing custom migrations for complex scenarios.
+
+## Auto-Generating Migrations
+
+For common use cases like adding columns, Snuba can auto-generate migrations from storage configuration changes.
+
+<Steps>
+
+<Step title="Locate the storage configuration">
+  Find the relevant `storage.yaml` file for your table:
+  
+  ```bash
+  # Storage configurations are located in:
+  snuba/datasets/configuration/<dataset>/storages/<storage>.yaml
+  
+  # Example:
+  snuba/datasets/configuration/group_attributes/storages/group_attributes.yaml
+  ```
+</Step>
+
+<Step title="Modify the storage schema">
+  Edit the `schema.columns` section to add your new column:
+  
+  ```yaml
+  schema:
+    columns:
+      - name: project_id
+        type: UInt(64)
+      - name: group_id
+        type: UInt(64)
+      - name: new_column  # Add new column
+        type: String
+        args:
+          nullable: true
+  ```
+</Step>
+
+<Step title="Generate the migration">
+  Run the migration generator:
+  
+  ```bash
+  snuba migrations generate path/to/storage.yaml
+  ```
+  
+  This creates a new migration file with the appropriate operations.
+</Step>
+
+<Step title="Review and commit">
+  Review the generated migration file, test it, and commit:
+  
+  ```bash
+  # Test the migration
+  snuba migrations run --group <group> --migration-id <id> --dry-run
+  
+  # Commit if everything looks good
+  git add snuba/snuba_migrations/<group>/<migration_id>.py
+  git commit -m "Add new_column to group_attributes"
+  ```
+</Step>
+
+</Steps>
+
+<Note>
+  Auto-generation currently supports adding columns to existing tables. For other operations, you'll need to write a custom migration.
+</Note>
+
+## Writing Custom Migrations
+
+### Step 1: Determine the Migration Group
+
+Choose the appropriate migration group based on which tables you're modifying:
+
+| Group | Purpose |
+|-------|--------|
+| `system` | Core migration infrastructure |
+| `events` | Error event tables |
+| `transactions` | Transaction tables |
+| `discover` | Discover dataset |
+| `metrics` | Metrics and counters |
+| `sessions` | Session data |
+| `profiles` | Profiling data |
+| `functions` | Function profiling |
+| `spans` | Span data |
+
+### Step 2: Create the Migration File
+
+Migrations must follow a specific naming convention:
+
+```bash
+# Format: <4-digit-number>_<descriptive_name>.py
+# Number must be sequential within the group
+
+# Find the next migration number
+ls snuba/snuba_migrations/<group>/ | grep -E '^[0-9]{4}' | tail -1
+
+# Create new migration file
+touch snuba/snuba_migrations/<group>/0042_add_user_agent_column.py
+```
+
+### Step 3: Choose Migration Type
+
+Select the appropriate base class for your migration:
+
+#### ClickhouseNodeMigration (SQL Operations)
+
+For DDL operations like creating tables, adding columns, or modifying indexes:
+
+```python snuba/snuba_migrations/events/0042_add_user_agent_column.py
+from typing import Sequence
+from snuba.clickhouse.columns import Column, String
+from snuba.clusters.storage_sets import StorageSetKey
+from snuba.migrations import migration, operations
+from snuba.migrations.columns import MigrationModifiers as Modifiers
+from snuba.migrations.operations import OperationTarget
+
+class Migration(migration.ClickhouseNodeMigration):
+    blocking = False
+    
+    def forwards_ops(self) -> Sequence[operations.SqlOperation]:
+        return [
+            operations.AddColumn(
+                storage_set=StorageSetKey.EVENTS,
+                table_name="errors_local",
+                column=Column(
+                    "user_agent",
+                    String(Modifiers(nullable=True))
+                ),
+                after="user_email",
+                target=OperationTarget.LOCAL,
+            ),
+            operations.AddColumn(
+                storage_set=StorageSetKey.EVENTS,
+                table_name="errors_dist",
+                column=Column(
+                    "user_agent",
+                    String(Modifiers(nullable=True))
+                ),
+                after="user_email",
+                target=OperationTarget.DISTRIBUTED,
+            ),
+        ]
+    
+    def backwards_ops(self) -> Sequence[operations.SqlOperation]:
+        return [
+            operations.DropColumn(
+                storage_set=StorageSetKey.EVENTS,
+                table_name="errors_dist",
+                column_name="user_agent",
+                target=OperationTarget.DISTRIBUTED,
+            ),
+            operations.DropColumn(
+                storage_set=StorageSetKey.EVENTS,
+                table_name="errors_local",
+                column_name="user_agent",
+                target=OperationTarget.LOCAL,
+            ),
+        ]
+```
+
+#### CodeMigration (Python Functions)
+
+For complex logic, data migrations, or operations requiring runtime decisions:
+
+```python snuba/snuba_migrations/events/0043_migrate_user_data.py
+import logging
+from typing import Sequence
+from snuba.clusters.cluster import ClickhouseClientSettings, get_cluster
+from snuba.clusters.storage_sets import StorageSetKey
+from snuba.migrations import migration, operations
+
+def migrate_user_data(logger: logging.Logger) -> None:
+    """Migrate user data from old format to new format."""
+    cluster = get_cluster(StorageSetKey.EVENTS)
+    connection = cluster.get_query_connection(
+        ClickhouseClientSettings.MIGRATE
+    )
+    
+    # Perform data migration
+    logger.info("Starting user data migration")
+    connection.execute(
+        "ALTER TABLE errors_local UPDATE user_name = ... WHERE ..."
+    )
+    logger.info("User data migration complete")
+
+class Migration(migration.CodeMigration):
+    blocking = True  # Data migrations should be blocking
+    
+    def forwards_global(self) -> Sequence[operations.GenericOperation]:
+        return [
+            operations.RunPython(
+                func=migrate_user_data,
+                description="Migrate user data to new format",
+            ),
+        ]
+    
+    def backwards_global(self) -> Sequence[operations.GenericOperation]:
+        # Usually cannot reverse data migrations
+        return []
+```
+
+## Available Operations
+
+### Table Operations
+
+<CodeGroup>
+
+```python CreateTable
+operations.CreateTable(
+    storage_set=StorageSetKey.EVENTS,
+    table_name="events_local",
+    columns=[
+        Column("project_id", UInt(64)),
+        Column("timestamp", DateTime()),
+        Column("event_id", UUID()),
+    ],
+    engine=table_engines.MergeTree(
+        storage_set=StorageSetKey.EVENTS,
+        order_by="(project_id, timestamp)",
+        partition_by="(toMonday(timestamp))",
+        ttl="timestamp + toIntervalDay(90)",
+    ),
+    target=OperationTarget.LOCAL,
+)
+```
+
+```python DropTable
+operations.DropTable(
+    storage_set=StorageSetKey.EVENTS,
+    table_name="events_local",
+    target=OperationTarget.LOCAL,
+)
+```
+
+```python RenameTable
+operations.RenameTable(
+    storage_set=StorageSetKey.EVENTS,
+    old_table_name="events_local_old",
+    new_table_name="events_local",
+    target=OperationTarget.LOCAL,
+)
+```
+
+```python TruncateTable
+operations.TruncateTable(
+    storage_set=StorageSetKey.EVENTS,
+    table_name="events_local",
+    target=OperationTarget.LOCAL,
+)
+```
+
+</CodeGroup>
+
+### Column Operations
+
+<CodeGroup>
+
+```python AddColumn
+operations.AddColumn(
+    storage_set=StorageSetKey.EVENTS,
+    table_name="events_local",
+    column=Column(
+        "new_field",
+        String(Modifiers(nullable=True, low_cardinality=True))
+    ),
+    after="existing_column",  # Optional positioning
+    target=OperationTarget.LOCAL,
+)
+```
+
+```python DropColumn
+operations.DropColumn(
+    storage_set=StorageSetKey.EVENTS,
+    table_name="events_local",
+    column_name="old_field",
+    target=OperationTarget.LOCAL,
+)
+```
+
+```python ModifyColumn
+operations.ModifyColumn(
+    storage_set=StorageSetKey.EVENTS,
+    table_name="events_local",
+    column=Column(
+        "existing_field",
+        String()  # Change type or modifiers
+    ),
+    target=OperationTarget.LOCAL,
+)
+```
+
+</CodeGroup>
+
+### Index Operations
+
+<CodeGroup>
+
+```python AddIndex
+operations.AddIndex(
+    storage_set=StorageSetKey.EVENTS,
+    table_name="events_local",
+    index_name="user_id_bloom",
+    index_expression="user_id",
+    index_type="bloom_filter(0.01)",
+    granularity=4,
+    target=OperationTarget.LOCAL,
+)
+```
+
+```python DropIndex
+operations.DropIndex(
+    storage_set=StorageSetKey.EVENTS,
+    table_name="events_local",
+    index_name="user_id_bloom",
+    target=OperationTarget.LOCAL,
+)
+```
+
+```python AddIndices
+operations.AddIndices(
+    storage_set=StorageSetKey.EVENTS,
+    table_name="events_local",
+    indices=[
+        operations.AddIndicesData(
+            name="user_bloom",
+            expression="user_id",
+            type="bloom_filter(0.01)",
+            granularity=4,
+        ),
+        operations.AddIndicesData(
+            name="email_bloom",
+            expression="user_email",
+            type="bloom_filter(0.01)",
+            granularity=4,
+        ),
+    ],
+    target=OperationTarget.LOCAL,
+)
+```
+
+</CodeGroup>
+
+### TTL Operations
+
+<CodeGroup>
+
+```python ModifyTableTTL
+operations.ModifyTableTTL(
+    storage_set=StorageSetKey.EVENTS,
+    table_name="events_local",
+    reference_column="timestamp",
+    ttl_days=90,
+    materialize_ttl_on_modify=True,
+    target=OperationTarget.LOCAL,
+)
+```
+
+</CodeGroup>
+
+### Settings Operations
+
+<CodeGroup>
+
+```python ModifyTableSettings
+operations.ModifyTableSettings(
+    storage_set=StorageSetKey.EVENTS,
+    table_name="events_local",
+    settings={
+        "index_granularity": 8192,
+        "min_bytes_for_wide_part": 0,
+    },
+    target=OperationTarget.LOCAL,
+)
+```
+
+```python ResetTableSettings
+operations.ResetTableSettings(
+    storage_set=StorageSetKey.EVENTS,
+    table_name="events_local",
+    settings=["index_granularity", "min_bytes_for_wide_part"],
+    target=OperationTarget.LOCAL,
+)
+```
+
+</CodeGroup>
+
+### Custom SQL
+
+```python RunSql
+operations.RunSql(
+    storage_set=StorageSetKey.EVENTS,
+    statement="""
+        ALTER TABLE events_local
+        MODIFY SETTING max_concurrent_queries = 100
+    """,
+    target=OperationTarget.LOCAL,
+)
+```
+
+### Data Operations
+
+```python InsertIntoSelect
+operations.InsertIntoSelect(
+    storage_set=StorageSetKey.EVENTS,
+    dest_table_name="events_new_local",
+    dest_columns=["project_id", "timestamp", "event_id"],
+    src_table_name="events_old_local",
+    src_columns=["project_id", "timestamp", "event_id"],
+    where="timestamp >= '2024-01-01'",
+    target=OperationTarget.LOCAL,
+)
+```
+
+## Operation Ordering
+
+The order of operations matters, especially for distributed tables:
+
+### Adding Columns or Tables
+
+```python
+def forwards_ops(self) -> Sequence[operations.SqlOperation]:
+    return [
+        # 1. Create/modify local tables FIRST
+        operations.AddColumn(
+            table_name="events_local",
+            target=OperationTarget.LOCAL,
+            # ...
+        ),
+        # 2. Then create/modify distributed tables
+        operations.AddColumn(
+            table_name="events_dist",
+            target=OperationTarget.DISTRIBUTED,
+            # ...
+        ),
+    ]
+```
+
+<Note>
+  Add to local tables first, then distributed. This prevents the distributed table from referencing non-existent columns.
+</Note>
+
+### Dropping Columns or Tables
+
+```python
+def backwards_ops(self) -> Sequence[operations.SqlOperation]:
+    return [
+        # 1. Drop from distributed tables FIRST
+        operations.DropColumn(
+            table_name="events_dist",
+            target=OperationTarget.DISTRIBUTED,
+            # ...
+        ),
+        # 2. Then drop from local tables
+        operations.DropColumn(
+            table_name="events_local",
+            target=OperationTarget.LOCAL,
+            # ...
+        ),
+    ]
+```
+
+<Warning>
+  Drop from distributed tables first, then local. Dropping local columns while the distributed table references them causes errors.
+</Warning>
+
+## Column Types and Modifiers
+
+Snuba provides type-safe column definitions:
+
+```python
+from snuba.clickhouse.columns import (
+    Column, String, UInt, UUID, DateTime, Array, Nested
+)
+from snuba.migrations.columns import MigrationModifiers as Modifiers
+
+columns = [
+    # Basic types
+    Column("id", UInt(64)),
+    Column("name", String()),
+    Column("timestamp", DateTime()),
+    Column("event_id", UUID()),
+    
+    # With modifiers
+    Column("environment", String(Modifiers(
+        nullable=True,
+        low_cardinality=True,
+    ))),
+    
+    # Arrays
+    Column("tag_values", Array(String())),
+    
+    # Nested structures
+    Column("tags", Nested([
+        ("key", String()),
+        ("value", String()),
+    ])),
+]
+```
+
+## Table Engines
+
+Snuba automatically selects the appropriate engine based on cluster configuration:
+
+<CodeGroup>
+
+```python MergeTree
+table_engines.MergeTree(
+    storage_set=StorageSetKey.EVENTS,
+    order_by="(project_id, timestamp)",
+    primary_key="(project_id, timestamp)",  # Optional
+    partition_by="(toMonday(timestamp))",
+    sample_by="cityHash64(event_id)",  # Optional
+    ttl="timestamp + toIntervalDay(90)",
+    settings={
+        "index_granularity": 8192,
+    },
+)
+```
+
+```python ReplacingMergeTree
+table_engines.ReplacingMergeTree(
+    storage_set=StorageSetKey.EVENTS,
+    order_by="(project_id, group_id)",
+    version_column="version",  # Determines which row to keep
+    partition_by="(toMonday(timestamp))",
+)
+```
+
+```python AggregatingMergeTree
+table_engines.AggregatingMergeTree(
+    storage_set=StorageSetKey.METRICS,
+    order_by="(project_id, metric_id, timestamp)",
+    partition_by="(toMonday(timestamp))",
+)
+```
+
+```python Distributed
+table_engines.Distributed(
+    local_table_name="events_local",
+    sharding_key="cityHash64(project_id)",  # Optional
+)
+```
+
+</CodeGroup>
+
+<Note>
+  In single-node mode, `MergeTree` engines are used. In distributed mode, they automatically become `ReplicatedMergeTree` with appropriate ZooKeeper paths.
+</Note>
+
+## Testing Migrations
+
+### Dry Run
+
+Preview SQL without executing:
+
+```bash
+snuba migrations run \
+    --group events \
+    --migration-id 0042_add_user_agent_column \
+    --dry-run
+```
+
+Output:
+```
+Local op: ALTER TABLE errors_local ADD COLUMN IF NOT EXISTS user_agent String AFTER user_email;
+Dist op: ALTER TABLE errors_dist ADD COLUMN IF NOT EXISTS user_agent String AFTER user_email;
+```
+
+### Run Migration
+
+Execute the migration:
+
+```bash
+snuba migrations run \
+    --group events \
+    --migration-id 0042_add_user_agent_column \
+    --force
+```
+
+### Verify Results
+
+Check migration status:
+
+```bash
+snuba migrations list --group events
+```
+
+Verify schema changes:
+
+```bash
+echo "DESCRIBE TABLE errors_local" | clickhouse-client
+```
+
+## Best Practices
+
+<Steps>
+
+<Step title="Test locally first">
+  Always test migrations in development before production:
+  
+  ```bash
+  # Test with dry-run
+  snuba migrations run --group <group> --migration-id <id> --dry-run
+  
+  # Execute in local environment
+  snuba migrations run --group <group> --migration-id <id> --force
+  ```
+</Step>
+
+<Step title="Write reversible migrations">
+  Always provide backward operations that restore the original state:
+  
+  ```python
+  def backwards_ops(self) -> Sequence[operations.SqlOperation]:
+      # Don't just return empty list
+      return [
+          operations.DropColumn(
+              table_name="events_local",
+              column_name="user_agent",
+              target=OperationTarget.LOCAL,
+          ),
+      ]
+  ```
+</Step>
+
+<Step title="Set blocking flag appropriately">
+  Mark migrations as blocking if they:
+  - Migrate large amounts of data
+  - Require significant processing time
+  - Need consumers to be stopped
+  
+  ```python
+  class Migration(migration.ClickhouseNodeMigration):
+      blocking = True  # Requires --force
+  ```
+</Step>
+
+<Step title="Update storage schemas">
+  After adding a migration, update the corresponding storage schema file to match. Tests will fail if schemas are inconsistent.
+</Step>
+
+<Step title="Consider operation order">
+  Use the validator to catch ordering issues:
+  
+  ```python
+  # tests/migrations/test_validator.py
+  from snuba.migrations.validator import validate_migration_order
+  
+  validate_migration_order(migration)
+  ```
+</Step>
+
+</Steps>
+
+## Common Pitfalls
+
+<Warning>
+  **Don't forget operation targets**
+  
+  ```python
+  # BAD - target defaults to UNSET
+  operations.AddColumn(
+      storage_set=StorageSetKey.EVENTS,
+      table_name="events_local",
+      column=Column("field", String()),
+  )
+  
+  # GOOD - explicitly set target
+  operations.AddColumn(
+      storage_set=StorageSetKey.EVENTS,
+      table_name="events_local",
+      column=Column("field", String()),
+      target=OperationTarget.LOCAL,  # Explicit target
+  )
+  ```
+</Warning>
+
+<Warning>
+  **Wrong operation order**
+  
+  ```python
+  # BAD - distributed before local
+  def forwards_ops(self):
+      return [
+          operations.AddColumn(target=OperationTarget.DISTRIBUTED, ...),
+          operations.AddColumn(target=OperationTarget.LOCAL, ...),
+      ]
+  
+  # GOOD - local before distributed
+  def forwards_ops(self):
+      return [
+          operations.AddColumn(target=OperationTarget.LOCAL, ...),
+          operations.AddColumn(target=OperationTarget.DISTRIBUTED, ...),
+      ]
+  ```
+</Warning>
+
+<Warning>
+  **Dropping primary key columns**
+  
+  You cannot drop columns that are part of the primary key or sorting key:
+  
+  ```python
+  # This will fail if project_id is in ORDER BY
+  operations.DropColumn(
+      table_name="events_local",
+      column_name="project_id",
+      target=OperationTarget.LOCAL,
+  )
+  ```
+</Warning>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Migration Modes" icon="network-wired" href="/migrations/modes">
+    Learn about single-node vs distributed configurations
+  </Card>
+  <Card title="Distributed Strategies" icon="server" href="/migrations/distributed">
+    Advanced patterns for multi-node deployments
+  </Card>
+</CardGroup>

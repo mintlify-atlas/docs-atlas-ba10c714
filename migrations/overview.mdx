@@ -1,0 +1,226 @@
+---
+title: Migration System Overview
+description: Understanding Snuba's database migration system for ClickHouse schema management
+---
+
+## Introduction
+
+Snuba provides a comprehensive migration system to manage ClickHouse database schemas and state. The migration system enables controlled schema evolution as the Snuba codebase changes, ensuring that database changes are applied consistently and safely across different deployment configurations.
+
+<Warning>
+  The migration system is still evolving. While single-node configurations are fully supported, distributed and replicated ClickHouse deployments have experimental support and should be used with caution in production.
+</Warning>
+
+## What Are Migrations?
+
+Migrations are the mechanism through which database changes are defined and applied to evolve ClickHouse schemas. Each migration represents a discrete set of changes that can be applied (forward) or reversed (backward) to maintain database consistency.
+
+### Key Concepts
+
+<Steps>
+
+<Step title="Migration Groups">
+  Migrations are organized into groups that typically correspond to features or related tables. Groups are executed in a strict order, with all migrations in one group completing before the next group begins.
+  
+  Each group is represented by a folder in `snuba/snuba_migrations/`, such as:
+  - `system` - Core migration tracking (always runs first)
+  - `events` - Event data tables
+  - `transactions` - Transaction data tables
+  - `discover` - Discover dataset tables
+  - `metrics` - Metrics storage
+</Step>
+
+<Step title="Migration Sequence">
+  Within each group, migrations are numbered sequentially (e.g., `0001_`, `0002_`, `0003_`) and must be applied in order. This ensures that dependencies between migrations are properly satisfied.
+</Step>
+
+<Step title="Optional vs Mandatory Groups">
+  Most migration groups are mandatory, but some are optional and can be toggled via `settings.SKIPPED_MIGRATION_GROUPS`. Optional groups allow testing experimental features without affecting all deployments.
+</Step>
+
+</Steps>
+
+## Types of Migrations
+
+Snuba supports three primary migration types:
+
+### 1. ClickHouse Node Migrations
+
+The most common type, these execute SQL statements on ClickHouse nodes to modify schema. They inherit from `ClickhouseNodeMigration`.
+
+```python snuba/snuba_migrations/discover/0008_discover_fix_add_local_table.py
+from snuba.migrations import migration, operations, table_engines
+from snuba.migrations.operations import OperationTarget
+
+class Migration(migration.ClickhouseNodeMigration):
+    blocking = False
+    
+    def forwards_ops(self) -> Sequence[operations.SqlOperation]:
+        return [
+            operations.CreateTable(
+                storage_set=StorageSetKey.DISCOVER,
+                table_name="discover_local",
+                columns=columns,
+                engine=table_engines.Merge(
+                    table_name_regex="^errors_local$|^transactions_local$"
+                ),
+                target=OperationTarget.LOCAL,
+            ),
+        ]
+    
+    def backwards_ops(self) -> Sequence[operations.SqlOperation]:
+        return []
+```
+
+**Use cases:**
+- Creating or dropping tables
+- Adding or removing columns
+- Creating indexes
+- Modifying table settings
+- Changing TTL policies
+
+### 2. Code Migrations
+
+These execute Python functions for complex logic that cannot be expressed as pure SQL. They inherit from `CodeMigration`.
+
+```python snuba/snuba_migrations/functions/0001_functions.py
+class Migration(migration.CodeMigration):
+    blocking = False
+    
+    def forwards_global(self) -> Sequence[operations.GenericOperation]:
+        return [
+            operations.RunSqlAsCode(
+                operations.CreateTable(
+                    storage_set=self.storage_set,
+                    table_name=self.local_raw_table,
+                    columns=raw_columns,
+                    engine=table_engines.MergeTree(
+                        storage_set=self.storage_set,
+                        order_by="(project_id, transaction_name, timestamp)",
+                        partition_by="(toStartOfInterval(timestamp, INTERVAL 12 HOUR))",
+                        ttl="timestamp + toIntervalDay(1)",
+                    ),
+                    target=operations.OperationTarget.LOCAL,
+                )
+            ),
+        ]
+    
+    def backwards_global(self) -> Sequence[operations.GenericOperation]:
+        return []
+```
+
+**Use cases:**
+- Data migrations
+- Conditional logic based on cluster configuration
+- Complex multi-step operations
+- Version-specific behavior
+
+### 3. Squashed Migrations
+
+Placeholder migrations that used to exist but are now safe to skip. They're kept in the sequence for historical consistency.
+
+```python
+class Migration(migration.SquashedMigration):
+    pass
+```
+
+## Migration Lifecycle
+
+### Status States
+
+Each migration has one of three statuses:
+
+- **NOT_STARTED** - Migration hasn't been executed
+- **IN_PROGRESS** - Migration is currently running
+- **COMPLETED** - Migration has been successfully applied
+
+### Forward and Backward Operations
+
+Every migration must define both:
+
+- **Forward operations** - Apply the migration changes
+- **Backward operations** - Revert the migration changes
+
+Backward operations serve two purposes:
+1. Allow recovery if a migration fails partway through
+2. Enable rolling back completed migrations when necessary
+
+<Note>
+  Once a migration is completed and the system is running with that schema, backwards operations should generally not be used to revert to a prior state, as they cannot always restore deleted data.
+</Note>
+
+## Blocking Migrations
+
+Migrations that cannot complete immediately must be marked with `blocking = True`. These typically involve:
+
+- Large data migrations
+- Operations that rewrite significant amounts of data
+- Changes requiring downtime
+
+```python
+class Migration(migration.CodeMigration):
+    blocking = True  # Requires --force flag
+    
+    def forwards_global(self) -> Sequence[operations.RunPython]:
+        return [
+            operations.RunPython(
+                func=fix_order_by,
+                description="Sync project ID column for onpremise"
+            ),
+        ]
+```
+
+<Warning>
+  Blocking migrations must be run with the `--force` flag. They may require stopping relevant consumers to prevent data inconsistencies during execution.
+</Warning>
+
+## Storage Sets and Clusters
+
+The `settings.CLUSTERS` mapping defines the relationship between storage sets and ClickHouse clusters:
+
+```python
+CLUSTERS = [
+    {
+        "host": "localhost",
+        "port": 9000,
+        "storage_sets": {"events", "transactions", "discover"},
+        "single_node": True,
+    },
+]
+```
+
+- **Storage sets** - Groups of tables that must be colocated
+- **Clusters** - Physical ClickHouse deployment configurations
+- **Single node** - If `True`, simplified migration paths are used
+
+Every storage set must be assigned to exactly one cluster.
+
+## Migration Tracking
+
+Snuba tracks migration status in dedicated ClickHouse tables:
+
+- `migrations_local` - Used in single-node deployments
+- `migrations_dist` - Used in multi-node deployments
+
+These tables store:
+- Migration group
+- Migration ID
+- Status (NOT_STARTED, IN_PROGRESS, COMPLETED)
+- Timestamp
+- Version number
+
+The system automatically creates these tables via the first migration in the `system` group.
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Migration Modes" icon="network-wired" href="/migrations/modes">
+    Learn about single-node vs distributed deployment configurations
+  </Card>
+  <Card title="Creating Migrations" icon="code" href="/migrations/creating-migrations">
+    Step-by-step guide to writing your own migrations
+  </Card>
+  <Card title="Distributed Strategies" icon="server" href="/migrations/distributed">
+    Advanced topics for multi-node ClickHouse deployments
+  </Card>
+</CardGroup>

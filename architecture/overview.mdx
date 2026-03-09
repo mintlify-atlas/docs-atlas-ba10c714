@@ -1,0 +1,216 @@
+---
+title: "Architecture Overview"
+description: "High-level overview of Snuba's architecture and core components"
+---
+
+Snuba is a time-series oriented data store backed by ClickHouse, designed to power Sentry's query infrastructure. It provides high-performance querying capabilities for events, transactions, metrics, and other observability data.
+
+## System Architecture
+
+Snuba's architecture consists of three main subsystems that work together to provide a complete data pipeline:
+
+<CardGroup cols={3}>
+  <Card title="Storage Layer" icon="database">
+    ClickHouse-backed storage with flexible table engines and replication
+  </Card>
+  <Card title="Ingestion Pipeline" icon="arrow-down-to-line">
+    Kafka-based event ingestion with message processing and batching
+  </Card>
+  <Card title="Query Engine" icon="magnifying-glass">
+    Multi-stage query processing with optimization and execution
+  </Card>
+</CardGroup>
+
+## Core Components
+
+### Storage
+
+ClickHouse was chosen as the backing storage because it provides:
+
+- **Real-time performance** - Fast query execution for time-series data
+- **Distributed architecture** - Horizontal scalability across multiple nodes
+- **Flexible storage engines** - Multiple table engines for different use cases
+- **Replication** - Data redundancy and high availability
+- **Materialized views** - Pre-aggregated data for optimized queries
+
+Data is stored in ClickHouse tables and materialized views, organized into multiple **Datasets** that represent independent partitions of the data model.
+
+```python
+# Example: Cluster configuration from snuba/clusters/cluster.py
+class ClickhouseCluster:
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        database: str,
+        storage_sets: Set[str],
+        single_node: bool,
+        cluster_name: Optional[str] = None,
+    ):
+        # Manages connections to ClickHouse nodes
+        # Provides readers and writers for queries and inserts
+```
+
+### Ingestion
+
+Snuba does not provide a direct API endpoint to insert rows (except in debug mode). Instead, data is loaded through a Kafka-based pipeline:
+
+1. **Kafka Topics** - Events arrive on topics like `events`, `transactions`, `outcomes`
+2. **Consumers** - Process messages in batches from Kafka
+3. **Message Processors** - Transform Kafka messages to ClickHouse rows
+4. **Batch Writers** - Write batched data to ClickHouse tables
+
+<Note>
+  Each ClickHouse table is written to by exactly one consumer, enabling consistency guarantees through proper table engine selection.
+</Note>
+
+Consumers support batching for efficiency and guarantee **at-least-once** delivery. When combined with ClickHouse's deduplicating table engines, this achieves **exactly-once semantics** with eventual consistency.
+
+```python
+# Example: Consumer processing from snuba/consumers/consumer.py
+class ProcessedMessageBatchWriter:
+    """Batches messages and writes to ClickHouse"""
+    
+    def submit(self, message: Message[BytesInsertBatch]) -> None:
+        # Accumulate messages
+        self.__messages.append(message)
+    
+    def close(self) -> None:
+        # Write entire batch to ClickHouse
+        self.__writer.write(
+            itertools.chain.from_iterable(
+                message.payload.rows for message in self.__messages
+            )
+        )
+```
+
+### Query Processing
+
+Queries are expressed in **SnQL** (Snuba Query Language) or **MQL** (Metrics Query Language) and sent as HTTP POST requests. The query engine:
+
+1. **Parses** the query into an Abstract Syntax Tree (AST)
+2. **Validates** against the data model schema
+3. **Applies logical processors** for product-level transformations
+4. **Selects storage** from available options
+5. **Translates** to physical ClickHouse query
+6. **Applies physical processors** for query optimization
+7. **Executes** on ClickHouse and returns results
+
+<Accordion title="Query Processing Pipeline">
+```
+SnQL/MQL Query
+     |
+     v
+[Parser] --> Logical Query AST
+     |
+     v
+[Validation] --> Check against entity schema
+     |
+     v
+[Logical Processors] --> Apply custom functions, time bucketing
+     |
+     v
+[Storage Selector] --> Pick optimal storage/table
+     |
+     v
+[Query Translator] --> Convert to physical query
+     |
+     v
+[Physical Processors] --> Optimize filters, indexes
+     |
+     v
+[Formatter] --> Generate ClickHouse SQL
+     |
+     v
+[Execution] --> Run on ClickHouse cluster
+```
+</Accordion>
+
+## Streaming Queries (Subscriptions)
+
+Beyond point-in-time queries, Snuba supports **streaming queries** through the Subscription Engine:
+
+1. Client registers a subscription query via HTTP endpoint
+2. Subscription Consumer monitors relevant Kafka topics
+3. Query runs periodically as new data arrives
+4. Results are produced to subscription result topics
+
+This enables features like alerts and real-time monitoring.
+
+## Data Consistency Models
+
+Snuba supports multiple consistency models:
+
+### Eventual Consistency (Default)
+
+- Queries can hit any ClickHouse replica
+- No guarantee replicas are synchronized
+- Optimal for high-throughput queries
+
+### Strong Consistency (Optional)
+
+- Forces ClickHouse to reach consistency (FINAL keyword)
+- Queries directed to specific replica consumer writes to
+- Achieves sequential consistency
+- Higher latency and resource usage
+
+<Warning>
+  Strong consistency should be used sparingly. Most use cases don't actually require it and it significantly impacts performance.
+</Warning>
+
+## Deployment Architecture
+
+In a typical Sentry deployment, Snuba processes multiple data pipelines:
+
+### Errors and Transactions Pipeline
+
+- **Input**: `events` Kafka topic (shared by errors and transactions)
+- **Consumers**: Errors Consumer and Transactions Consumer
+- **Tables**: `errors_local`/`errors_dist` and `transactions_local`/`transactions_dist`
+- **Commit Log**: `snuba-commit-log` for synchronization
+- **Subscriptions**: Separate subscription consumers for alerts
+- **Replacements**: Errors mutations (merge/unmerge) via `replacements` topic
+
+### Sessions Pipeline
+
+- **Input**: `sessions` Kafka topic
+- **Consumer**: Sessions Consumer
+- **Purpose**: Powers Release Health features
+
+### Outcomes Pipeline
+
+- **Input**: `outcomes` Kafka topic
+- **Consumer**: Outcomes Consumer
+- **Purpose**: Billing and stats data
+
+## Key Design Principles
+
+1. **Horizontal scaling** - Independent datasets and storage sets
+2. **Batch processing** - Efficient Kafka and ClickHouse operations
+3. **Query optimization** - Multi-stage processing pipeline
+4. **Consistency tradeoffs** - Configurable consistency models
+5. **Multi-tenancy** - Dataset slicing for isolation
+
+## Component Location in Source
+
+- **Storage**: `snuba/clusters/cluster.py`, `snuba/datasets/storage.py`
+- **Ingestion**: `snuba/consumers/`, `snuba/processor.py`
+- **Query**: `snuba/web/query.py`, `snuba/pipeline/query_pipeline.py`
+- **Datasets**: `snuba/datasets/configuration/`
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Data Model" href="/architecture/data-model">
+    Learn about Datasets, Entities, and Storages
+  </Card>
+  <Card title="Query Processing" href="/architecture/query-processing">
+    Deep dive into the query pipeline
+  </Card>
+  <Card title="Ingestion" href="/architecture/ingestion">
+    Understand Kafka consumers and message processing
+  </Card>
+  <Card title="Storage" href="/architecture/storage">
+    Explore ClickHouse storage implementation
+  </Card>
+</CardGroup>

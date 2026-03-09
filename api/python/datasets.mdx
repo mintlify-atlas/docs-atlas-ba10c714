@@ -1,0 +1,345 @@
+---
+title: Datasets
+description: Work with Snuba datasets programmatically
+---
+
+The Datasets API provides programmatic access to Snuba's data models and entities.
+
+## Dataset Class
+
+A Dataset represents a data model that can be queried in Snuba.
+
+```python
+from snuba.datasets.dataset import Dataset
+from snuba.datasets.factory import get_dataset
+
+# Get a dataset by name
+dataset = get_dataset("events")
+
+# Access entities in the dataset
+entities = dataset.get_all_entities()
+for entity in entities:
+    print(entity)
+```
+
+Source: `snuba/datasets/dataset.py`
+
+### Dataset Methods
+
+<ParamField path="get_all_entities()" type="method">
+  Returns all entities belonging to this dataset
+  
+  **Returns**: `Sequence[Entity]`
+</ParamField>
+
+## Dataset Factory
+
+The factory provides centralized access to all datasets.
+
+```python
+from snuba.datasets.factory import (
+    get_dataset,
+    get_dataset_name,
+    get_enabled_dataset_names,
+    InvalidDatasetError
+)
+
+# Get dataset by name
+try:
+    dataset = get_dataset("events")
+except InvalidDatasetError as e:
+    print(f"Dataset not found: {e}")
+
+# Get dataset name from instance
+name = get_dataset_name(dataset)
+print(f"Dataset name: {name}")
+
+# List all enabled datasets
+all_datasets = get_enabled_dataset_names()
+print(f"Available datasets: {all_datasets}")
+```
+
+Source: `snuba/datasets/factory.py`
+
+### Factory Functions
+
+<ResponseField name="get_dataset" type="function">
+  Get a dataset by name
+  
+  **Parameters**:
+  - `name` (str): Dataset name (e.g., "events", "transactions")
+  
+  **Returns**: `Dataset`
+  
+  **Raises**: `InvalidDatasetError` if dataset doesn't exist or is disabled
+</ResponseField>
+
+<ResponseField name="get_dataset_name" type="function">
+  Get the name of a dataset instance
+  
+  **Parameters**:
+  - `dataset` (Dataset): Dataset instance
+  
+  **Returns**: `str`
+</ResponseField>
+
+<ResponseField name="get_enabled_dataset_names" type="function">
+  List all enabled dataset names
+  
+  **Returns**: `list[str]`
+</ResponseField>
+
+## Entities
+
+Entities represent queryable data models within datasets.
+
+```python
+from snuba.datasets.entities.factory import get_entity
+from snuba.datasets.entities.entity_key import EntityKey
+
+# Get entity by key
+entity = get_entity(EntityKey.EVENTS)
+
+# Access entity properties
+print(f"Storages: {entity.get_all_storages()}")
+print(f"Required time column: {entity.required_time_column}")
+
+# Get writable storage
+writable_storage = entity.get_writable_storage()
+if writable_storage:
+    table_writer = writable_storage.get_table_writer()
+```
+
+### Entity Methods
+
+<ParamField path="get_all_storages()" type="method">
+  Get all storages for this entity
+  
+  **Returns**: `Sequence[Storage]`
+</ParamField>
+
+<ParamField path="get_writable_storage()" type="method">
+  Get the writable storage for this entity
+  
+  **Returns**: `Optional[WritableTableStorage]`
+</ParamField>
+
+<ParamField path="get_subscription_processors()" type="method">
+  Get processors for subscription queries
+  
+  **Returns**: `Optional[Sequence[SubscriptionProcessor]]`
+</ParamField>
+
+<ParamField path="get_subscription_validators()" type="method">
+  Get validators for subscription creation
+  
+  **Returns**: `Optional[Sequence[SubscriptionValidator]]`
+</ParamField>
+
+## Pluggable Datasets
+
+Pluggable datasets are configured via YAML:
+
+```python
+from snuba.datasets.pluggable_dataset import PluggableDataset
+
+# Create a pluggable dataset
+dataset = PluggableDataset(
+    name="my_dataset",
+    all_entities=[EntityKey.MY_ENTITY]
+)
+```
+
+Source: `snuba/datasets/pluggable_dataset.py`
+
+## Storage
+
+Storages represent the physical tables in ClickHouse.
+
+```python
+from snuba.datasets.storage import Storage, WritableTableStorage
+
+# Get storage from entity
+entity = get_entity(EntityKey.EVENTS)
+storages = entity.get_all_storages()
+
+for storage in storages:
+    # Get storage key
+    key = storage.get_storage_key()
+    
+    # Get schema
+    schema = storage.get_schema()
+    
+    # Get cluster
+    cluster = storage.get_cluster()
+    
+    # Check if writable
+    if isinstance(storage, WritableTableStorage):
+        table_writer = storage.get_table_writer()
+        stream_loader = table_writer.get_stream_loader()
+```
+
+### Storage Methods
+
+<ParamField path="get_storage_key()" type="method">
+  Get the storage identifier
+  
+  **Returns**: `StorageKey`
+</ParamField>
+
+<ParamField path="get_schema()" type="method">
+  Get the table schema
+  
+  **Returns**: `TableSchema`
+</ParamField>
+
+<ParamField path="get_cluster()" type="method">
+  Get the ClickHouse cluster
+  
+  **Returns**: `ClickhouseCluster`
+</ParamField>
+
+## Complete Example
+
+Here's a complete example using the datasets API:
+
+```python
+from snuba.datasets.factory import get_dataset, get_enabled_dataset_names
+from snuba.datasets.entities.entity_key import EntityKey
+from snuba.datasets.entities.factory import get_entity
+
+# List all available datasets
+print("Available datasets:")
+for dataset_name in get_enabled_dataset_names():
+    print(f"  - {dataset_name}")
+
+# Get events dataset
+events_dataset = get_dataset("events")
+print(f"\nDataset: events")
+
+# Get all entities
+entities = events_dataset.get_all_entities()
+print(f"Entities: {len(entities)}")
+
+for entity in entities:
+    print(f"\nEntity: {entity}")
+    
+    # Get storages
+    storages = entity.get_all_storages()
+    print(f"  Storages: {len(storages)}")
+    
+    for storage in storages:
+        key = storage.get_storage_key()
+        schema = storage.get_schema()
+        print(f"    - {key.value}")
+        
+        # Get table info
+        if hasattr(schema, 'get_local_table_name'):
+            table = schema.get_local_table_name()
+            print(f"      Table: {table}")
+    
+    # Check subscription support
+    sub_processors = entity.get_subscription_processors()
+    if sub_processors:
+        print(f"  Subscription processors: {len(sub_processors)}")
+    
+    # Get time column
+    time_col = entity.required_time_column
+    if time_col:
+        print(f"  Time column: {time_col}")
+```
+
+Output:
+
+```
+Available datasets:
+  - events
+  - transactions
+  - metrics
+  - profiles
+
+Dataset: events
+Entities: 1
+
+Entity: <Entity: events>
+  Storages: 2
+    - events
+      Table: sentry_local
+    - errors
+      Table: errors_local
+  Time column: timestamp
+```
+
+## Dataset Configuration
+
+Datasets can be configured via YAML files:
+
+```yaml
+version: v1
+kind: readable_storage
+name: events
+
+storage:
+  key: events
+  set_key: events
+
+readiness_state: complete
+
+schema:
+  columns:
+    - name: event_id
+      type: String
+    - name: project_id
+      type: UInt64
+    - name: timestamp
+      type: DateTime
+```
+
+Configuration files are loaded from: `settings.DATASET_CONFIG_FILES_GLOB`
+
+## Entity Keys
+
+Common entity keys:
+
+```python
+from snuba.datasets.entities.entity_key import EntityKey
+
+# Available entity keys
+EntityKey.EVENTS
+EntityKey.TRANSACTIONS
+EntityKey.METRICS_COUNTERS
+EntityKey.METRICS_DISTRIBUTIONS
+EntityKey.METRICS_SETS
+EntityKey.PROFILES
+EntityKey.PROFILE_FUNCTIONS
+EntityKey.REPLAYS
+```
+
+## Error Handling
+
+```python
+from snuba.datasets.factory import InvalidDatasetError
+
+try:
+    dataset = get_dataset("nonexistent")
+except InvalidDatasetError as e:
+    print(f"Error: {e}")
+    # Error: dataset 'nonexistent' does not exist
+
+try:
+    dataset = get_dataset("disabled_dataset")
+except InvalidDatasetError as e:
+    print(f"Error: {e}")
+    # Error: dataset 'disabled_dataset' is disabled in this environment
+```
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="Query Builder" icon="hammer" href="/api/python/query-builder">
+    Build queries programmatically
+  </Card>
+  <Card title="Processors" icon="gears" href="/api/python/processors">
+    Query processing pipeline
+  </Card>
+</CardGroup>

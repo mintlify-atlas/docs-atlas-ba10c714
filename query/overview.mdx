@@ -1,0 +1,348 @@
+---
+title: Query Overview
+description: Learn how to send queries to Snuba and understand response formats
+---
+
+This guide provides an overview of querying Snuba, including how to send queries, understand responses, and work with both SnQL and MQL query languages.
+
+## Query Languages
+
+Snuba supports two query languages:
+
+- **SnQL (Snuba Query Language)**: A SQL-like language for querying events, transactions, and other entities
+- **MQL (Metrics Query Language)**: A specialized language for querying metrics and timeseries data
+
+Both languages can be sent to Snuba via HTTP endpoints and return structured JSON responses.
+
+## Endpoints
+
+Snuba provides dataset-specific endpoints for executing queries:
+
+### SnQL Endpoint
+
+```
+POST /:dataset/snql
+```
+
+For example:
+- `/discover/snql` - Query the discover dataset
+- `/events/snql` - Query the events dataset
+- `/transactions/snql` - Query the transactions dataset
+
+### MQL Endpoint
+
+```
+POST /:dataset/mql
+```
+
+For example:
+- `/generic_metrics/mql` - Query metrics data
+
+## Request Format
+
+### SnQL Request
+
+SnQL queries are sent as JSON payloads with the following structure:
+
+```json
+{
+  "query": "MATCH (events) SELECT event_id, project_id WHERE timestamp >= toDateTime('2024-01-01')",
+  "dataset": "discover",
+  "debug": false,
+  "consistent": false,
+  "turbo": false,
+  "tenant_ids": {
+    "organization_id": 123,
+    "referrer": "my_app"
+  }
+}
+```
+
+<ParamField path="query" type="string" required>
+  The SnQL query string to execute
+</ParamField>
+
+<ParamField path="dataset" type="string">
+  The dataset name (optional if specified in the URL)
+</ParamField>
+
+<ParamField path="debug" type="boolean" default="false">
+  When true, returns additional debugging information including the generated SQL query and detailed statistics
+</ParamField>
+
+<ParamField path="consistent" type="boolean" default="false">
+  Forces single-threaded execution and routes to the same node for sequential consistency
+</ParamField>
+
+<ParamField path="turbo" type="boolean" default="false">
+  Applies sampling to speed up query execution at the cost of accuracy
+</ParamField>
+
+<ParamField path="tenant_ids" type="object" required>
+  Identification information for the query:
+  - `organization_id`: Organization identifier
+  - `referrer`: String identifying the source of the query
+</ParamField>
+
+### MQL Request
+
+MQL queries use a different structure with a query string and context object:
+
+```json
+{
+  "mql": "sum(transaction.duration){environment:prod} by status_code",
+  "mql_context": {
+    "entity": "generic_metrics_distributions",
+    "start": "2023-01-02T03:04:05+00:00",
+    "end": "2023-01-16T03:04:05+00:00",
+    "rollup": {
+      "granularity": 3600,
+      "interval": 3600,
+      "with_totals": null
+    },
+    "scope": {
+      "org_ids": [1],
+      "project_ids": [11],
+      "use_case_id": "transactions"
+    },
+    "limit": 100,
+    "offset": 0
+  }
+}
+```
+
+## Response Format
+
+### Successful Response
+
+A successful query returns a JSON response with the following structure:
+
+```json
+{
+  "data": [
+    {
+      "event_id": "abc123",
+      "project_id": 1,
+      "timestamp": "2024-01-01T12:00:00"
+    },
+    {
+      "event_id": "def456",
+      "project_id": 1,
+      "timestamp": "2024-01-01T12:01:00"
+    }
+  ],
+  "meta": [
+    {
+      "name": "event_id",
+      "type": "UUID"
+    },
+    {
+      "name": "project_id",
+      "type": "UInt64"
+    },
+    {
+      "name": "timestamp",
+      "type": "DateTime"
+    }
+  ],
+  "timing": {
+    "timestamp": 1621038379,
+    "duration_ms": 95,
+    "marks_ms": {
+      "cache_get": 1,
+      "cache_set": 4,
+      "execute": 39,
+      "prepare_query": 10,
+      "rate_limit": 4,
+      "validate_schema": 34
+    }
+  },
+  "stats": {
+    "clickhouse_table": "events_local",
+    "final": false,
+    "sample": null,
+    "consistent": false,
+    "result_rows": 2,
+    "result_cols": 3,
+    "query_id": "f09f3f9e1c632f395792c6a4bfe7c4fe"
+  }
+}
+```
+
+#### Response Fields
+
+<ParamField path="data" type="array">
+  Array of result rows, where each row is an object with column names as keys
+</ParamField>
+
+<ParamField path="meta" type="array">
+  Schema information for each column in the result set:
+  - `name`: Column name
+  - `type`: ClickHouse data type
+</ParamField>
+
+<ParamField path="timing" type="object">
+  Performance metrics:
+  - `timestamp`: Unix timestamp when the query was executed
+  - `duration_ms`: Total query duration in milliseconds
+  - `marks_ms`: Breakdown of time spent in each processing phase
+</ParamField>
+
+<ParamField path="stats" type="object">
+  Query execution statistics:
+  - `clickhouse_table`: The table that was queried
+  - `final`: Whether FINAL was applied to the query
+  - `sample`: Sampling rate if applied
+  - `consistent`: Whether consistent mode was used
+  - `result_rows`: Number of rows returned
+  - `result_cols`: Number of columns returned
+  - `query_id`: Unique identifier for this query
+</ParamField>
+
+### Debug Mode Response
+
+When `debug: true` is set in the request, the response includes an additional `sql` field:
+
+```json
+{
+  "data": [...],
+  "meta": [...],
+  "timing": {...},
+  "stats": {...},
+  "sql": "SELECT event_id, project_id FROM events_local WHERE ..."
+}
+```
+
+The `sql` field contains the actual ClickHouse SQL query that was generated and executed.
+
+### Error Response
+
+Error responses follow this format:
+
+```json
+{
+  "error": {
+    "type": "invalid_query",
+    "message": "Missing >= condition with a datetime literal on column timestamp"
+  }
+}
+```
+
+## HTTP Status Codes
+
+<Tabs>
+  <Tab title="200 OK">
+    Query executed successfully
+  </Tab>
+  <Tab title="400 Bad Request">
+    Query validation failed - invalid syntax or missing required conditions
+  </Tab>
+  <Tab title="429 Too Many Requests">
+    Rate limit exceeded
+  </Tab>
+  <Tab title="500 Internal Server Error">
+    ClickHouse error or internal failure
+  </Tab>
+</Tabs>
+
+## Using the Web UI
+
+Snuba provides a minimal web UI for testing queries. When running Snuba locally, access it at:
+
+```
+http://127.0.0.1:1218/:dataset/snql
+```
+
+The UI provides a simple form where you can:
+- Enter your SnQL query
+- Set query options (debug, consistent, turbo)
+- View the response in formatted JSON
+
+## Using curl
+
+You can send queries using curl or any HTTP client:
+
+```bash
+curl -X POST http://127.0.0.1:1218/discover/snql \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "MATCH (events) SELECT count() AS total WHERE project_id = 1 AND timestamp >= toDateTime('"'"'2024-01-01'"'"') AND timestamp < toDateTime('"'"'2024-01-02'"'"') LIMIT 1000",
+    "tenant_ids": {
+      "organization_id": 1,
+      "referrer": "test"
+    },
+    "debug": true
+  }'
+```
+
+## Using the Python SDK
+
+The recommended way to build queries programmatically is using the [Snuba SDK](https://github.com/getsentry/snuba-sdk):
+
+```python
+from datetime import datetime
+from snuba_sdk import (
+    Column,
+    Condition,
+    Entity,
+    Function,
+    Limit,
+    Op,
+    Query,
+)
+
+query = Query(
+    dataset="discover",
+    match=Entity("events"),
+    select=[
+        Column("title"),
+        Function("uniq", [Column("event_id")], "uniq_events"),
+    ],
+    groupby=[Column("title")],
+    where=[
+        Condition(Column("timestamp"), Op.GT, datetime(2021, 1, 1)),
+        Condition(Column("project_id"), Op.IN, Function("tuple", [1, 2, 3])),
+    ],
+    limit=Limit(10),
+)
+```
+
+## Query Processing Pipeline
+
+Snuba processes queries through multiple stages:
+
+1. **Parsing**: SnQL/MQL string is parsed into an AST
+2. **Validation**: Query is validated against entity requirements
+3. **Logical Processing**: Entity-specific transformations are applied
+4. **Storage Selection**: Optimal storage/table is selected
+5. **Translation**: Logical query is translated to physical ClickHouse query
+6. **Physical Processing**: Optimizations are applied
+7. **Execution**: Query is executed on ClickHouse
+
+This pipeline ensures queries are valid, optimized, and safe to execute.
+
+<Note>
+  Some entities require specific conditions (e.g., project_id and timestamp range) to prevent expensive queries. Check entity documentation for requirements.
+</Note>
+
+## Best Practices
+
+- **Always include time bounds**: Most entities require timestamp conditions to prevent full table scans
+- **Use appropriate limits**: Default limit is 1000 rows if not specified
+- **Enable debug mode during development**: Helps understand query performance and optimization
+- **Use consistent mode sparingly**: It reduces concurrency and may impact performance
+- **Leverage the SDK**: Building queries with the SDK prevents syntax errors and provides type safety
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="SnQL Syntax" icon="code" href="/query/snql">
+    Learn the complete SnQL syntax and available functions
+  </Card>
+  <Card title="MQL Syntax" icon="chart-line" href="/query/mql">
+    Explore MQL for metrics and timeseries queries
+  </Card>
+  <Card title="Optimization" icon="gauge-high" href="/query/optimization">
+    Optimize your queries for better performance
+  </Card>
+</CardGroup>

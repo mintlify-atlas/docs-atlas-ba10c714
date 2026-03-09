@@ -1,0 +1,576 @@
+---
+title: "Transactions Dataset"
+description: "Performance monitoring data with timing information, spans, and custom measurements"
+---
+
+<Note>
+The transactions dataset stores performance monitoring data from Sentry, including transaction timing, spans, measurements, and distributed tracing information. It powers Sentry's performance monitoring features.
+</Note>
+
+## Overview
+
+The transactions dataset captures timing data for operations in your application. Each transaction represents a single request, page load, or background task with detailed performance metrics.
+
+### Key Characteristics
+
+- **Storage**: Single writable `transactions` storage
+- **Entity**: Single `transactions` entity
+- **Partitioning**: By retention_days and date
+- **Primary Use Cases**: Performance monitoring, APM, transaction search, custom dashboards
+
+## Entity: transactions
+
+The transactions entity provides the query interface for performance data.
+
+### Core Columns
+
+#### Identification
+
+```yaml
+event_id: UUID              # Unique identifier for the transaction
+project_id: UInt64          # Required for all queries
+trace_id: UUID              # Distributed trace identifier
+span_id: UInt64             # Root span ID
+```
+
+#### Transaction Details
+
+```yaml
+transaction_name: String    # Transaction name (e.g., "/api/users")
+transaction_hash: UInt64    # Hash of transaction name (readonly)
+transaction_op: String      # Operation type (pageload, navigation, http.server)
+transaction_status: UInt8   # Status code (ok, cancelled, unknown, etc.)
+transaction_source: String  # How transaction name was determined
+```
+
+<Note>
+**transaction_op** categorizes the type of operation. Common values:
+- `pageload` - Initial page load
+- `navigation` - Client-side navigation
+- `http.server` - Server-side HTTP request
+- `task` - Background task
+- `function` - Function execution
+</Note>
+
+#### Timestamps & Duration
+
+```yaml
+timestamp: DateTime         # End time (readonly, maps to finish_ts)
+start_ts: DateTime          # Transaction start time
+start_ms: UInt16            # Millisecond component of start
+finish_ts: DateTime         # Transaction finish time (required time column)
+finish_ms: UInt16           # Millisecond component of finish
+duration: UInt32            # Duration in milliseconds
+time: DateTime              # Query time column (maps to finish_ts)
+```
+
+<Note>
+The required time column for queries is **finish_ts**. When you use **time** in queries, it's automatically mapped to **finish_ts**.
+</Note>
+
+#### User Context
+
+```yaml
+user: String               # User identifier (promoted from tags)
+user_id: String            # User ID
+user_name: String          # Username
+user_email: String         # User email
+user_hash: UInt64          # Hash of user identifier (readonly)
+```
+
+#### HTTP Context
+
+```yaml
+http_method: String        # HTTP request method
+http_referer: String       # HTTP referer header
+ip_address_v4: IPv4        # Client IPv4 address
+ip_address_v6: IPv6        # Client IPv6 address
+```
+
+#### SDK & Platform
+
+```yaml
+platform: String           # Platform (python, javascript, etc.)
+sdk_name: String           # SDK name
+sdk_version: String        # SDK version
+```
+
+#### Release Context
+
+```yaml
+release: String            # Release version (promoted from tags)
+environment: String        # Environment name (promoted from tags)
+dist: String               # Distribution identifier (promoted from tags)
+```
+
+### Nested Structures
+
+#### Tags
+
+```yaml
+tags: Nested(
+  key: String,
+  value: String
+)
+_tags_hash_map: Array(UInt64)  # Optimization for tag lookups
+```
+
+Promoted tags (automatically extracted to top-level columns):
+- `environment` → `environment`
+- `sentry:release` → `release`
+- `sentry:dist` → `dist`
+- `sentry:user` → `user`
+- `trace.trace_id` → `trace_id`
+- `trace.span_id` → `span_id`
+
+#### Contexts
+
+```yaml
+contexts: Nested(
+  key: String,
+  value: String
+)
+```
+
+Stores structured context data including:
+- `geo.country_code`, `geo.region`, `geo.city` - Geographic information
+- `trace.trace_id`, `trace.span_id` - Tracing data
+- Browser and OS information
+- Custom context data
+
+#### Measurements
+
+```yaml
+measurements: Nested(
+  key: String,
+  value: Float64
+)
+```
+
+Custom numeric measurements including:
+- `fp` - First Paint
+- `fcp` - First Contentful Paint
+- `lcp` - Largest Contentful Paint
+- `fid` - First Input Delay
+- `cls` - Cumulative Layout Shift
+- `ttfb` - Time to First Byte
+- Custom measurements
+
+#### Span Operation Breakdowns
+
+```yaml
+span_op_breakdowns: Nested(
+  key: String,
+  value: Float64
+)
+```
+
+Time spent in different operation types:
+- `ops.http` - HTTP request time
+- `ops.db` - Database query time
+- `ops.resource` - Resource loading time
+- `ops.browser` - Browser processing time
+
+#### Spans
+
+```yaml
+spans: Nested(
+  op: String,              # Span operation type
+  group: UInt64,           # Span group hash
+  exclusive_time: Float64, # Time exclusive to this span
+  exclusive_time_32: Float32  # 32-bit version for optimization
+)
+```
+
+The spans array contains summary information about all spans in the transaction.
+
+### Integration Fields
+
+```yaml
+group_ids: Array(UInt64)   # Associated error group IDs
+profile_id: UUID           # Associated profiling data
+profiler_id: UUID          # Profiler instance ID
+replay_id: UUID            # Associated session replay
+app_start_type: String     # Mobile app start type
+```
+
+### Processing Metadata
+
+```yaml
+partition: UInt16          # Kafka partition
+offset: UInt64             # Kafka offset
+message_timestamp: DateTime # Kafka message timestamp
+retention_days: UInt16     # Data retention period
+deleted: UInt8             # Soft delete flag
+type: String               # Event type (always "transaction", readonly)
+message: String            # Maps to transaction_name (readonly)
+title: String              # Maps to transaction_name (readonly)
+```
+
+## Storage: transactions
+
+The writable storage for transaction data.
+
+### Table Structure
+
+```sql
+CREATE TABLE transactions_local (
+    project_id UInt64,
+    event_id UUID,
+    trace_id UUID,
+    span_id UInt64,
+    transaction_name String,
+    start_ts DateTime,
+    finish_ts DateTime,
+    duration UInt32,
+    -- ... other columns
+) ENGINE = MergeTree()
+PARTITION BY (retention_days, toMonday(finish_ts))
+ORDER BY (project_id, toStartOfDay(finish_ts), event_id)
+```
+
+### Storage Configuration
+
+```yaml
+storage:
+  key: transactions
+  set_key: transactions
+readiness_state: complete
+local_table_name: transactions_local
+dist_table_name: transactions_dist
+partition_format:
+  - retention_days
+  - date
+```
+
+## Query Processors
+
+Transactions storage applies multiple query processors for optimization:
+
+### Time Series Processing
+
+```yaml
+- processor: TimeSeriesProcessor
+  args:
+    time_group_columns:
+      time: finish_ts
+    time_parse_columns:
+      - start_ts
+      - finish_ts
+      - timestamp
+```
+
+Maps time-related columns and handles time-based grouping.
+
+### UUID Processing
+
+```yaml
+- processor: UUIDColumnProcessor
+  args:
+    columns: [event_id, trace_id, profile_id, profiler_id, replay_id]
+```
+
+Converts UUID strings to binary format.
+
+### Hex Integer Processing
+
+```yaml
+- processor: HexIntColumnProcessor
+  args:
+    columns: [span_id]
+```
+
+Handles hex-encoded span IDs.
+
+### Array Optimization
+
+```yaml
+- processor: BloomFilterOptimizer
+  args:
+    column_name: spans
+    key_names: [op, group]
+    val_names: [exclusive_time_32]
+
+- processor: ArrayJoinOptimizer
+  args:
+    column_name: spans
+    key_names: [op, group]
+    val_names: [exclusive_time_32]
+```
+
+Optimizes queries on the spans nested column using bloom filters and array joins.
+
+### Special Function Processors
+
+```yaml
+- processor: ApdexProcessor      # Calculates Apdex scores
+- processor: FailureRateProcessor # Calculates failure rates
+```
+
+### Prewhere Optimization
+
+```yaml
+- processor: PrewhereProcessor
+  args:
+    prewhere_candidates:
+      - event_id
+      - trace_id
+      - span_id
+      - transaction_name
+      - transaction
+      - title
+```
+
+## Allocation Policies
+
+```yaml
+allocation_policies:
+  - name: ConcurrentRateLimitAllocationPolicy
+    required_tenant_types:
+      - organization_id
+      - referrer
+      - project_id
+  - name: BytesScannedWindowAllocationPolicy
+    required_tenant_types:
+      - organization_id
+      - referrer
+    default_config_overrides:
+      is_enforced: 1
+      org_limit_bytes_scanned: 100000
+```
+
+## Data Ingestion
+
+### Stream Loader
+
+```yaml
+stream_loader:
+  processor: TransactionsMessageProcessor
+  default_topic: transactions
+  commit_log_topic: snuba-transactions-commit-log
+  subscription_scheduler_mode: global
+  subscription_delay_seconds: 30
+```
+
+### Message Format
+
+Transactions are ingested from Kafka:
+
+```json
+[
+  2,
+  "insert",
+  {
+    "project_id": 1,
+    "event_id": "abc123...",
+    "data": {
+      "type": "transaction",
+      "timestamp": 1647532800.0,
+      "start_timestamp": 1647532799.5,
+      "transaction": "/api/users",
+      "transaction_info": {
+        "source": "route"
+      },
+      "contexts": {
+        "trace": {
+          "trace_id": "def456...",
+          "span_id": "789abc...",
+          "op": "http.server",
+          "status": "ok"
+        }
+      },
+      "measurements": {
+        "lcp": {"value": 2500.0}
+      },
+      "spans": [...]
+    }
+  }
+]
+```
+
+## Example Queries
+
+### Find slow transactions
+
+```sql
+MATCH (transactions)
+SELECT transaction_name, avg(duration) as avg_duration
+WHERE project_id = 1
+  AND finish_ts >= toDateTime('2024-01-01 00:00:00')
+  AND finish_ts < toDateTime('2024-01-02 00:00:00')
+  AND duration > 1000
+GROUP BY transaction_name
+ORDER BY avg_duration DESC
+LIMIT 10
+```
+
+### Calculate Apdex score
+
+```sql
+MATCH (transactions)
+SELECT 
+  transaction_name,
+  apdex(duration, 300) as apdex_score
+WHERE project_id = 1
+  AND finish_ts >= toDateTime('2024-01-01 00:00:00')
+  AND finish_ts < toDateTime('2024-01-02 00:00:00')
+GROUP BY transaction_name
+ORDER BY apdex_score DESC
+```
+
+### Query by trace ID
+
+```sql
+MATCH (transactions)
+SELECT 
+  transaction_name,
+  duration,
+  start_ts,
+  finish_ts
+WHERE project_id = 1
+  AND trace_id = 'def456...'
+  AND finish_ts >= toDateTime('2024-01-01 00:00:00')
+  AND finish_ts < toDateTime('2024-01-02 00:00:00')
+```
+
+### Analyze span operations
+
+```sql
+MATCH (transactions)
+SELECT 
+  transaction_name,
+  arrayJoin(spans.op) as span_op,
+  avg(arrayJoin(spans.exclusive_time)) as avg_time
+WHERE project_id = 1
+  AND finish_ts >= toDateTime('2024-01-01 00:00:00')
+  AND finish_ts < toDateTime('2024-01-02 00:00:00')
+GROUP BY transaction_name, span_op
+ORDER BY avg_time DESC
+LIMIT 20
+```
+
+### Web Vitals analysis
+
+```sql
+MATCH (transactions)
+SELECT 
+  quantile(0.5)(measurements[lcp]) as p50_lcp,
+  quantile(0.75)(measurements[lcp]) as p75_lcp,
+  quantile(0.95)(measurements[lcp]) as p95_lcp
+WHERE project_id = 1
+  AND finish_ts >= toDateTime('2024-01-01 00:00:00')
+  AND finish_ts < toDateTime('2024-01-02 00:00:00')
+  AND transaction_op = 'pageload'
+  AND measurements[lcp] > 0
+```
+
+### Failure rate calculation
+
+```sql
+MATCH (transactions)
+SELECT 
+  transaction_name,
+  failure_rate() as failure_rate
+WHERE project_id = 1
+  AND finish_ts >= toDateTime('2024-01-01 00:00:00')
+  AND finish_ts < toDateTime('2024-01-02 00:00:00')
+GROUP BY transaction_name
+HAVING count() > 100
+ORDER BY failure_rate DESC
+```
+
+### Throughput over time
+
+```sql
+MATCH (transactions)
+SELECT 
+  toStartOfHour(finish_ts) as hour,
+  count() as transaction_count
+WHERE project_id = 1
+  AND finish_ts >= toDateTime('2024-01-01 00:00:00')
+  AND finish_ts < toDateTime('2024-01-02 00:00:00')
+GROUP BY hour
+ORDER BY hour
+```
+
+## Column Translation
+
+The transactions entity applies several column translations for compatibility:
+
+```yaml
+translation_mappers:
+  columns:
+    - mapper: ColumnToColumn
+      args:
+        from_col_name: timestamp
+        to_col_name: finish_ts
+    - mapper: ColumnToColumn
+      args:
+        from_col_name: transaction
+        to_col_name: transaction_name
+    - mapper: ColumnToColumn
+      args:
+        from_col_name: message
+        to_col_name: transaction_name
+```
+
+## Subscriptions
+
+The transactions entity supports subscriptions with restrictions:
+
+```yaml
+subscription_validators:
+  - validator: AggregationValidator
+    args:
+      max_allowed_aggregations: 1
+      disallowed_aggregations:
+        - groupby
+        - having
+        - orderby
+      required_time_column: finish_ts
+```
+
+<Note>
+Subscriptions on transactions are limited to 1 aggregation and cannot use GROUP BY, HAVING, or ORDER BY.
+</Note>
+
+## Performance Considerations
+
+<AccordionGroup>
+  <Accordion title="Always filter by project_id">
+    The project_id filter is mandatory and enforced by validators. It's critical for performance.
+  </Accordion>
+  
+  <Accordion title="Use finish_ts for time filtering">
+    The required time column is finish_ts. Always include it in your WHERE clause.
+  </Accordion>
+  
+  <Accordion title="Leverage low cardinality columns">
+    Columns like transaction_op, platform, and environment use LowCardinality optimization for efficient grouping.
+  </Accordion>
+  
+  <Accordion title="Be careful with span queries">
+    Querying the spans nested column can be expensive. Use bloom filter optimization when possible.
+  </Accordion>
+  
+  <Accordion title="Use promoted tags">
+    Access promoted columns (environment, release) directly rather than through tag subscripts.
+  </Accordion>
+</AccordionGroup>
+
+## Related Resources
+
+<CardGroup cols={2}>
+  <Card title="Events Dataset" icon="bug" href="/datasets/events">
+    Error data linked via trace_id and group_ids
+  </Card>
+  <Card title="Replays Dataset" icon="circle-play" href="/datasets/replays">
+    Session replays linked via replay_id
+  </Card>
+  <Card title="Spans Dataset" icon="diagram-project" href="/datasets/transactions">
+    Detailed span data for distributed tracing
+  </Card>
+  <Card title="Query Functions" icon="function" href="/query/functions">
+    Learn about apdex() and failure_rate() functions
+  </Card>
+</CardGroup>

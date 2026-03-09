@@ -1,80 +1,471 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+title: Quickstart Guide
+description: Get Snuba running locally in minutes and execute your first queries
 ---
 
-## Get started in three steps
+## Overview
 
-Get your documentation site running locally and make your first customization.
-
-### Step 1: Set up your local environment
-
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
-
-### Step 2: Deploy your changes
-
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
-
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
-
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
-
-### Step 3: Go live
-
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
-
-## Next steps
-
-Now that you have your docs running, explore these key features:
-
-<CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
-</CardGroup>
+This quickstart guide will walk you through setting up Snuba locally and executing your first queries. You'll learn how to start the services, run migrations, and query data using SnQL.
 
 <Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
+  This guide assumes you have Docker and Docker Compose installed. For other installation methods, see the [Installation](/installation) page.
+</Note>
+
+## Quick Start with Devservices
+
+The fastest way to get started with Snuba is using the devservices setup, which automatically manages all dependencies.
+
+<Steps>
+  <Step title="Clone the Repository">
+    First, clone the Snuba repository:
+    
+    ```bash
+    git clone https://github.com/getsentry/snuba.git
+    cd snuba
+    ```
+  </Step>
+  
+  <Step title="Install Dependencies">
+    Install devservices and Python dependencies:
+    
+    ```bash
+    # Install devservices (requires Python 3.13+)
+    pip install devservices
+    
+    # Install Snuba dependencies
+    pip install -e .
+    ```
+  </Step>
+  
+  <Step title="Start Services">
+    Use devservices to start ClickHouse, Kafka, and Redis:
+    
+    ```bash
+    devservices up clickhouse kafka redis
+    ```
+    
+    This will start all required services in Docker containers:
+    - **ClickHouse** on ports 9000 (native) and 8123 (HTTP)
+    - **Kafka** on port 9093
+    - **Redis** on port 6379
+  </Step>
+  
+  <Step title="Bootstrap and Migrate">
+    Initialize the database and run migrations:
+    
+    ```bash
+    # Bootstrap creates necessary Kafka topics and Redis keys
+    snuba bootstrap --force
+    
+    # Run database migrations to create ClickHouse tables
+    snuba migrations migrate --force
+    ```
+    
+    <Note>
+      The `--force` flag skips confirmation prompts. Remove it if you want to review changes before applying them.
+    </Note>
+  </Step>
+  
+  <Step title="Start the Devserver">
+    Start all Snuba processes (API, admin, consumers):
+    
+    ```bash
+    snuba devserver
+    ```
+    
+    This starts:
+    - **API server** on `http://localhost:1218`
+    - **Admin UI** on `http://localhost:1219`
+    - Multiple consumers for different data types (errors, transactions, metrics, etc.)
+    - Subscription schedulers and executors
+    
+    <Warning>
+      The devserver starts many consumer processes. If you only need the API, use:
+      ```bash
+      snuba devserver --no-workers
+      ```
+    </Warning>
+  </Step>
+</Steps>
+
+## Your First Query
+
+Now that Snuba is running, let's execute some queries using SnQL (Snuba Query Language).
+
+### Using the API Directly
+
+Snuba exposes an HTTP API for executing queries. Here's how to query the events dataset:
+
+<CodeGroup>
+```bash cURL
+curl -X POST http://localhost:1218/events/snql \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "query": "MATCH (events) SELECT count() AS event_count WHERE timestamp >= toDateTime('"'2024-01-01T00:00:00'"') AND timestamp < toDateTime('"'2024-01-02T00:00:00'"') AND project_id = 1",
+    "dataset": "events"
+  }'
+```
+
+```python Python
+import requests
+import json
+from datetime import datetime, timedelta
+
+# Define time range
+end_time = datetime.utcnow()
+start_time = end_time - timedelta(hours=24)
+
+# Build SnQL query
+query = f"""
+MATCH (events)
+SELECT count() AS event_count, platform
+BY platform
+WHERE timestamp >= toDateTime('{start_time.isoformat()}')
+  AND timestamp < toDateTime('{end_time.isoformat()}')
+  AND project_id = 1
+ORDER BY event_count DESC
+LIMIT 10
+"""
+
+# Execute query
+response = requests.post(
+    'http://localhost:1218/events/snql',
+    headers={'Content-Type': 'application/json'},
+    json={'query': query, 'dataset': 'events'}
+)
+
+result = response.json()
+print(json.dumps(result, indent=2))
+```
+
+```javascript JavaScript
+const axios = require('axios');
+
+const endTime = new Date();
+const startTime = new Date(endTime - 24 * 60 * 60 * 1000);
+
+const query = `
+MATCH (events)
+SELECT count() AS event_count, platform
+BY platform
+WHERE timestamp >= toDateTime('${startTime.toISOString()}')
+  AND timestamp < toDateTime('${endTime.toISOString()}')
+  AND project_id = 1
+ORDER BY event_count DESC
+LIMIT 10
+`;
+
+axios.post('http://localhost:1218/events/snql', {
+  query: query,
+  dataset: 'events'
+}, {
+  headers: {'Content-Type': 'application/json'}
+})
+.then(response => {
+  console.log(JSON.stringify(response.data, null, 2));
+})
+.catch(error => {
+  console.error('Error:', error.response?.data || error.message);
+});
+```
+</CodeGroup>
+
+### Understanding the Query
+
+Let's break down the SnQL query structure:
+
+```sql
+MATCH (events)              -- Specify the entity to query
+SELECT                      -- Select clause with expressions
+  count() AS event_count,   -- Aggregation function
+  platform                  -- Column to select
+BY platform                 -- Group by clause
+WHERE                       -- Filter conditions
+  timestamp >= toDateTime('2024-01-01T00:00:00')
+  AND timestamp < toDateTime('2024-01-02T00:00:00')
+  AND project_id = 1
+ORDER BY event_count DESC   -- Sort results
+LIMIT 10                    -- Limit number of results
+```
+
+**Key Components:**
+- `MATCH (entity)` - Specifies which entity to query (events, transactions, metrics_counters, etc.)
+- `SELECT` - Columns and aggregations to return
+- `BY` - Group by clause (similar to SQL's GROUP BY)
+- `WHERE` - Filter conditions (time range and project are typically required)
+- `ORDER BY` - Sort order
+- `LIMIT` - Maximum number of rows to return
+
+### Sample Query Results
+
+A successful query returns a JSON response with data and metadata:
+
+```json
+{
+  "data": [
+    {
+      "event_count": 1523,
+      "platform": "python"
+    },
+    {
+      "event_count": 892,
+      "platform": "javascript"
+    },
+    {
+      "event_count": 445,
+      "platform": "java"
+    }
+  ],
+  "meta": [
+    {"name": "event_count", "type": "UInt64"},
+    {"name": "platform", "type": "String"}
+  ],
+  "timing": {
+    "timestamp": 1704096000,
+    "duration_ms": 42
+  }
+}
+```
+
+## Common Query Patterns
+
+### Aggregations
+
+SnQL supports various aggregation functions:
+
+```sql
+MATCH (events)
+SELECT
+  count() AS total_events,
+  uniq(user) AS unique_users,
+  avg(duration) AS avg_duration,
+  max(timestamp) AS latest_event
+WHERE timestamp >= toDateTime('2024-01-01T00:00:00')
+  AND timestamp < toDateTime('2024-01-02T00:00:00')
+  AND project_id = 1
+```
+
+### Time Series with Granularity
+
+Group data by time buckets:
+
+```sql
+MATCH (events)
+SELECT
+  toStartOfHour(timestamp) AS time,
+  count() AS event_count
+BY time
+WHERE timestamp >= toDateTime('2024-01-01T00:00:00')
+  AND timestamp < toDateTime('2024-01-02T00:00:00')
+  AND project_id = 1
+ORDER BY time ASC
+GRANULARITY 3600
+```
+
+<Note>
+  `GRANULARITY` specifies the time bucket size in seconds. Common values:
+  - `60` - 1 minute
+  - `3600` - 1 hour
+  - `86400` - 1 day
+</Note>
+
+### Tag Filtering
+
+Query tags using subscript notation:
+
+```sql
+MATCH (events)
+SELECT count() AS error_count
+WHERE timestamp >= toDateTime('2024-01-01T00:00:00')
+  AND timestamp < toDateTime('2024-01-02T00:00:00')
+  AND project_id = 1
+  AND tags[environment] = 'production'
+  AND tags[level] IN tuple('error', 'fatal')
+```
+
+### Complex Conditions
+
+Use functions and complex expressions:
+
+```sql
+MATCH (transactions)
+SELECT
+  transaction_name,
+  quantile(0.95)(duration) AS p95_duration,
+  count() AS transaction_count
+BY transaction_name
+WHERE timestamp >= toDateTime('2024-01-01T00:00:00')
+  AND timestamp < toDateTime('2024-01-02T00:00:00')
+  AND project_id = 1
+  AND duration > 1000
+HAVING transaction_count > 100
+ORDER BY p95_duration DESC
+LIMIT 20
+```
+
+## Using the Admin UI
+
+Snuba includes a web-based admin interface for managing the system:
+
+<Steps>
+  <Step title="Access Admin UI">
+    Open your browser to `http://localhost:1219`
+  </Step>
+  
+  <Step title="View System Health">
+    Check the health of ClickHouse connections and Kafka consumers
+  </Step>
+  
+  <Step title="Run Migrations">
+    View migration status and run pending migrations from the UI
+  </Step>
+  
+  <Step title="Execute Test Queries">
+    Use the query editor to test SnQL queries interactively
+  </Step>
+</Steps>
+
+## Available Entities
+
+Snuba provides multiple entities you can query. Common ones include:
+
+| Entity | Dataset | Description |
+|--------|---------|-------------|
+| `events` | events | Error and issue events |
+| `transactions` | transactions | Performance transaction data |
+| `metrics_counters` | metrics | Counter metrics |
+| `metrics_sets` | metrics | Set metrics |
+| `generic_metrics_distributions` | metrics | Distribution metrics |
+| `profiles` | profiles | Profiling data |
+| `replays` | replays | Session replay data |
+| `search_issues` | search_issues | Issue search data |
+| `eap_items` | events_analytics_platform | EAP items |
+
+## Troubleshooting
+
+### Services Won't Start
+
+<AccordionGroup>
+  <Accordion title="Port already in use">
+    If ports 1218, 1219, 9000, 8123, or 6379 are already in use:
+    
+    ```bash
+    # Find process using port
+    lsof -i :1218
+    
+    # Kill the process or stop conflicting services
+    docker ps
+    docker stop <container-id>
+    ```
+  </Accordion>
+  
+  <Accordion title="ClickHouse connection failed">
+    Ensure ClickHouse is running and healthy:
+    
+    ```bash
+    # Check ClickHouse status
+    curl http://localhost:8123/ping
+    
+    # Should return "Ok."
+    ```
+  </Accordion>
+  
+  <Accordion title="Migration errors">
+    If migrations fail, you may need to reset:
+    
+    ```bash
+    # Drop all ClickHouse tables (destructive!)
+    snuba migrations migrate --force --reverse
+    
+    # Re-run migrations
+    snuba migrations migrate --force
+    ```
+  </Accordion>
+</AccordionGroup>
+
+### Query Errors
+
+<AccordionGroup>
+  <Accordion title="Invalid entity error">
+    Ensure you're querying an entity that exists and using the correct dataset endpoint.
+    
+    Available endpoints:
+    - `/events/snql` - Events dataset
+    - `/transactions/snql` - Transactions dataset  
+    - `/metrics/snql` - Metrics dataset
+  </Accordion>
+  
+  <Accordion title="Missing required time range">
+    Most queries require a time range filter:
+    
+    ```sql
+    WHERE timestamp >= toDateTime('...')
+      AND timestamp < toDateTime('...')
+    ```
+  </Accordion>
+  
+  <Accordion title="Project ID required">
+    Most entities require filtering by project_id:
+    
+    ```sql
+    WHERE project_id = 1
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Next Steps
+
+Now that you have Snuba running:
+
+<CardGroup cols={2}>
+  <Card title="Learn More About Installation" icon="download" href="/installation">
+    Explore different installation methods including Docker Compose and production deployments
+  </Card>
+  
+  <Card title="Query Language Reference" icon="book">
+    Deep dive into SnQL syntax, functions, and advanced query patterns
+  </Card>
+  
+  <Card title="Configuration" icon="gear">
+    Learn about configuring datasets, entities, and storages
+  </Card>
+  
+  <Card title="API Reference" icon="code">
+    Complete API documentation for all endpoints and parameters
+  </Card>
+</CardGroup>
+
+## Development Workflow
+
+For development, you can customize the devserver behavior:
+
+```bash
+# Start only the API (no consumers)
+snuba devserver --no-workers
+
+# Skip bootstrap on start
+snuba devserver --no-bootstrap
+
+# Set custom log level
+snuba devserver --log-level=debug
+```
+
+You can also start individual components:
+
+```bash
+# Start only the API server
+snuba api --bind 127.0.0.1:1218
+
+# Start only the admin UI
+snuba admin
+
+# Start a specific consumer
+snuba rust-consumer \
+  --storage=errors \
+  --consumer-group=errors_group \
+  --auto-offset-reset=latest
+```
+
+<Note>
+  For more details on the CLI commands, run `snuba --help` or `snuba <command> --help`.
 </Note>

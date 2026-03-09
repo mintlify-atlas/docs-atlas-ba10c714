@@ -1,0 +1,640 @@
+---
+title: Query Optimization
+description: Best practices and techniques for optimizing Snuba queries
+---
+
+Query optimization is crucial for maintaining good performance in Snuba. This guide covers techniques, best practices, and common pitfalls to help you write efficient queries.
+
+## Query Processing Pipeline
+
+Understanding how Snuba processes queries helps you write better ones:
+
+1. **Parsing**: Query string → AST
+2. **Validation**: Check entity requirements
+3. **Logical Processing**: Apply entity-specific transformations
+4. **Storage Selection**: Choose optimal table/view
+5. **Translation**: Logical → Physical query
+6. **Physical Processing**: Apply optimizations
+7. **Execution**: Run on ClickHouse
+
+Optimizations happen at multiple stages, but writing efficient queries from the start is most important.
+
+## Key Optimization Principles
+
+### 1. Always Include Required Conditions
+
+Most entities require specific conditions to prevent expensive queries.
+
+<Warning>
+  **Required Conditions** (typically):
+  - `project_id` condition
+  - Timestamp range condition
+  
+  Queries without these will be rejected or perform very poorly.
+</Warning>
+
+<CodeGroup>
+
+```sql Good - Has Requirements
+MATCH (events)
+SELECT count() AS total
+WHERE project_id IN array(1, 2, 3)
+  AND timestamp >= toDateTime('2024-01-01')
+  AND timestamp < toDateTime('2024-01-02')
+```
+
+```sql Bad - Missing Requirements
+MATCH (events)
+SELECT count() AS total
+WHERE type = 'error'
+-- Missing project_id and timestamp!
+```
+
+</CodeGroup>
+
+### 2. Use Appropriate Time Ranges
+
+Smaller time ranges are more efficient:
+
+- ✅ Query hours or days for real-time dashboards
+- ✅ Query weeks for trend analysis
+- ⚠️ Query months sparingly
+- ❌ Avoid querying years of data
+
+```sql
+-- Good: 24 hour window
+WHERE timestamp >= toDateTime('2024-01-01T00:00:00')
+  AND timestamp < toDateTime('2024-01-02T00:00:00')
+
+-- Better: 1 hour window for real-time
+WHERE timestamp >= toDateTime('2024-01-01T12:00:00')
+  AND timestamp < toDateTime('2024-01-01T13:00:00')
+```
+
+### 3. Leverage Indexes
+
+ClickHouse indexes certain columns for faster queries:
+
+**Indexed Columns** (typically):
+- `project_id`
+- `timestamp`
+- Tags (when promoted)
+- `event_id`, `group_id`, `transaction_id`
+
+<CodeGroup>
+
+```sql Fast - Uses Indexes
+WHERE project_id = 1
+  AND timestamp >= toDateTime('2024-01-01')
+  AND tags[environment] = 'production'
+```
+
+```sql Slow - No Indexes
+WHERE title LIKE '%error%'
+  AND message LIKE '%timeout%'
+```
+
+</CodeGroup>
+
+### 4. Use Appropriate Limits
+
+Always specify reasonable limits:
+
+```sql
+-- Good: Explicit reasonable limit
+LIMIT 100
+
+-- Acceptable: Use default (1000)
+-- (no LIMIT clause)
+
+-- Bad: Very large limit
+LIMIT 100000
+```
+
+<Note>
+  Default limit is 1000 rows. For pagination, use `LIMIT` with `OFFSET`:
+  ```sql
+  LIMIT 100 OFFSET 200
+  ```
+</Note>
+
+## SnQL Optimization Techniques
+
+### Tag Queries
+
+Snuba optimizes tag queries in different ways:
+
+<CodeGroup>
+
+```sql Optimized - Equality
+WHERE tags[environment] = 'production'
+-- Uses hashmap with bloom filter
+```
+
+```sql Less Optimized - Array Scan
+WHERE tags[environment] LIKE 'prod%'
+-- Requires scanning array
+```
+
+</CodeGroup>
+
+**Best Practices**:
+- Use equality (`=`) when possible
+- Use `IN` for multiple values: `tags[environment] IN array('prod', 'staging')`
+- Avoid `LIKE` on tags unless necessary
+
+### Aggregation Optimization
+
+#### Use Appropriate Aggregation Functions
+
+<Tabs>
+  <Tab title="Fast Aggregations">
+    - `count()`
+    - `sum()`
+    - `min()`, `max()`
+    - `uniq()` - Uses HyperLogLog (approximate)
+  </Tab>
+  <Tab title="Slower Aggregations">
+    - `uniqExact()` - Exact unique count
+    - `quantile()` - With high precision
+    - `groupArray()` - Collects all values
+  </Tab>
+</Tabs>
+
+```sql
+-- Fast: Approximate unique count
+SELECT uniq(user_id) AS unique_users
+
+-- Slow: Exact unique count
+SELECT uniqExact(user_id) AS unique_users
+```
+
+#### Limit Grouping Cardinality
+
+High-cardinality grouping is expensive:
+
+<CodeGroup>
+
+```sql Good - Low Cardinality
+SELECT count() AS total
+BY environment, status_code
+-- Few unique combinations
+```
+
+```sql Bad - High Cardinality
+SELECT count() AS total
+BY user_id, url, ip_address
+-- Millions of combinations
+```
+
+</CodeGroup>
+
+**Tips**:
+- Group by categorical data (environment, status codes)
+- Avoid grouping by UUIDs, timestamps, or high-cardinality strings
+- Use `LIMIT BY` to limit results per group
+
+### Sampling for Exploration
+
+Use sampling for exploratory queries:
+
+```sql
+MATCH (events SAMPLE 0.1)  -- Sample 10%
+SELECT count() * 10 AS estimated_total  -- Scale up result
+WHERE project_id = 1
+  AND timestamp >= toDateTime('2024-01-01')
+```
+
+Or use the `turbo` flag:
+
+```json
+{
+  "query": "...",
+  "turbo": true
+}
+```
+
+### Subquery Optimization
+
+Subqueries add overhead. Use them strategically:
+
+<CodeGroup>
+
+```sql Good Use - Multi-level Aggregation
+MATCH {
+  MATCH (transactions)
+  SELECT avg(duration) AS avg_d BY transaction
+  WHERE project_id = 1
+    AND timestamp >= toDateTime('2024-01-01')
+    AND timestamp < toDateTime('2024-01-02')
+}
+SELECT max(avg_d) AS max_avg
+```
+
+```sql Avoid - Unnecessary Subquery
+MATCH {
+  MATCH (transactions)
+  SELECT duration, transaction
+  WHERE project_id = 1
+    AND timestamp >= toDateTime('2024-01-01')
+}
+SELECT avg(duration) BY transaction
+-- Could be done in single query
+```
+
+</CodeGroup>
+
+### Join Optimization
+
+Joins are expensive. Optimize by:
+
+1. **Push filters into subqueries**: Filter before joining
+2. **Use appropriate join types**: Defined by entity relationships
+3. **Join on indexed columns**: Join keys are typically indexed
+
+```sql
+MATCH (e: events) -[grouped]-> (gm: groupedmessage)
+SELECT count() AS total BY e.group_id
+WHERE e.project_id = 1  -- Filter early
+  AND gm.project_id = 1
+  AND e.timestamp >= toDateTime('2024-01-01')
+  AND e.timestamp < toDateTime('2024-01-02')
+  AND gm.status = 0  -- Filter on join target
+```
+
+## MQL Optimization Techniques
+
+### Choose Appropriate Granularity
+
+Granularity affects query performance:
+
+```json
+{
+  "rollup": {
+    "interval": 3600,      // 1 hour intervals
+    "granularity": 3600    // Matches storage granularity
+  }
+}
+```
+
+**Guidelines**:
+- Match `granularity` to storage configuration
+- Use larger intervals for longer time ranges
+- 1 minute (60s) for real-time dashboards
+- 1 hour (3600s) for daily views
+- 1 day (86400s) for weekly/monthly views
+
+### Filter Early
+
+Filters in the MQL string are more efficient than post-processing:
+
+<CodeGroup>
+
+```mql Good - Filter in Query
+sum(transaction.duration){environment:prod, status_code:200}
+```
+
+```mql Less Optimal - Filter After
+sum(transaction.duration)
+-- Then filter environment:prod in application code
+```
+
+</CodeGroup>
+
+### Use Appropriate Aggregations
+
+Match aggregation to metric type:
+
+- **Counters**: `sum()`, `count()`
+- **Distributions**: `quantiles()`, `avg()`, `sum()`
+- **Sets**: `uniq()`
+- **Gauges**: `avg()`, `last()`, `min()`, `max()`
+
+```mql
+-- Good: Appropriate for distribution metric
+quantiles(0.5, 0.95, 0.99)(d:transactions/duration@millisecond)
+
+-- Bad: Sum is less meaningful for distributions
+sum(d:transactions/duration@millisecond)
+```
+
+### Limit Grouping Dimensions
+
+Limit the number of group-by tags:
+
+```mql
+-- Good: 1-2 dimensions
+sum(transaction.duration) by environment
+
+-- Acceptable: 2-3 dimensions
+sum(transaction.duration) by environment, status_code
+
+-- Avoid: Many dimensions
+sum(transaction.duration) by environment, status_code, transaction, user_id
+```
+
+## Storage-Level Optimizations
+
+### Final Queries
+
+Snuba may apply `FINAL` to ClickHouse queries to handle deduplication:
+
+```sql
+SELECT ... FROM events_local FINAL WHERE ...
+```
+
+**Impact**:
+- Forces merge of duplicate rows
+- Increases query time
+- Applied automatically when necessary
+
+**When Applied**:
+- Queries on ReplacingMergeTree tables
+- When consistent results are required
+
+**Avoid by**:
+- Using `turbo: true` (disables FINAL, may return duplicates)
+- Querying read-replica storages (already deduplicated)
+
+### Storage Selection
+
+Snuba may have multiple storages for an entity:
+
+- **Primary**: For consistent queries
+- **Replica**: For high-throughput queries
+- **Materialized Views**: Pre-aggregated for specific queries
+
+Snuba automatically selects the best storage based on:
+- Query pattern
+- `consistent` flag
+- Available storages
+
+## Monitoring Query Performance
+
+Use debug mode to understand query performance:
+
+```json
+{
+  "query": "...",
+  "debug": true
+}
+```
+
+### Interpret Timing Breakdown
+
+```json
+{
+  "timing": {
+    "duration_ms": 95,
+    "marks_ms": {
+      "cache_get": 1,
+      "validate_schema": 34,
+      "prepare_query": 10,
+      "rate_limit": 4,
+      "execute": 39,
+      "cache_set": 4
+    }
+  }
+}
+```
+
+**Key Metrics**:
+- `execute`: Time spent in ClickHouse - optimize query if high
+- `prepare_query`: Query processing time - usually low
+- `validate_schema`: Validation time - should be minimal
+
+### Interpret Stats
+
+```json
+{
+  "stats": {
+    "clickhouse_table": "events_local",
+    "final": false,
+    "sample": null,
+    "result_rows": 100,
+    "result_cols": 3
+  }
+}
+```
+
+**Red Flags**:
+- `final: true` - Consider using turbo mode if duplicates are acceptable
+- `result_rows: 100000` - Reduce limit or use pagination
+- Many results with no grouping - Add filtering or grouping
+
+### Review Generated SQL
+
+Debug mode includes the generated SQL:
+
+```json
+{
+  "sql": "SELECT count() FROM events_local WHERE project_id = 1 AND timestamp >= ..."
+}
+```
+
+Check for:
+- `PREWHERE` vs `WHERE` - PREWHERE is faster for indexed columns
+- `FINAL` keyword - Indicates deduplication overhead
+- Index usage - Conditions on indexed columns
+
+## Common Performance Issues
+
+### Issue: Slow Tag Queries
+
+<Tabs>
+  <Tab title="Problem">
+    ```sql
+    WHERE tags[custom_tag] LIKE '%value%'
+    ```
+    Scanning all tag arrays is slow
+  </Tab>
+  <Tab title="Solution">
+    ```sql
+    WHERE tags[custom_tag] = 'value'
+    ```
+    Use equality for hashmap optimization
+  </Tab>
+</Tabs>
+
+### Issue: High Cardinality Grouping
+
+<Tabs>
+  <Tab title="Problem">
+    ```sql
+    SELECT count() BY event_id, user_id, url
+    ```
+    Too many unique combinations
+  </Tab>
+  <Tab title="Solution">
+    ```sql
+    SELECT count() BY environment, status_code
+    LIMIT 100
+    ```
+    Group by categorical data with limits
+  </Tab>
+</Tabs>
+
+### Issue: Missing Required Conditions
+
+<Tabs>
+  <Tab title="Problem">
+    ```sql
+    MATCH (events)
+    SELECT count()
+    WHERE type = 'error'
+    ```
+    No project_id or timestamp
+  </Tab>
+  <Tab title="Solution">
+    ```sql
+    MATCH (events)
+    SELECT count()
+    WHERE project_id = 1
+      AND timestamp >= toDateTime('2024-01-01')
+      AND timestamp < toDateTime('2024-01-02')
+      AND type = 'error'
+    ```
+    Always include requirements
+  </Tab>
+</Tabs>
+
+### Issue: Large Time Range
+
+<Tabs>
+  <Tab title="Problem">
+    ```sql
+    WHERE timestamp >= toDateTime('2020-01-01')
+      AND timestamp < toDateTime('2024-01-01')
+    ```
+    Querying 4 years of data
+  </Tab>
+  <Tab title="Solution">
+    ```sql
+    WHERE timestamp >= toDateTime('2024-01-01')
+      AND timestamp < toDateTime('2024-01-02')
+    ```
+    Use smaller time windows
+  </Tab>
+</Tabs>
+
+## Query Optimization Checklist
+
+<CardGroup cols={1}>
+  <Card title="✅ Required Conditions">
+    - Include `project_id` condition
+    - Include timestamp range
+    - Use `IN array()` for multiple projects
+  </Card>
+  
+  <Card title="✅ Time Ranges">
+    - Use smallest reasonable time range
+    - Prefer hours/days over weeks/months
+    - Use appropriate datetime format
+  </Card>
+  
+  <Card title="✅ Filtering">
+    - Filter on indexed columns when possible
+    - Use equality over LIKE for tags
+    - Push filters before joins/aggregations
+  </Card>
+  
+  <Card title="✅ Aggregations">
+    - Use appropriate functions for metric types
+    - Prefer approximate functions (uniq vs uniqExact)
+    - Group by low-cardinality columns
+  </Card>
+  
+  <Card title="✅ Limits">
+    - Always use reasonable limits (≤1000)
+    - Use LIMIT BY for per-group limits
+    - Paginate large result sets
+  </Card>
+  
+  <Card title="✅ Sampling">
+    - Use SAMPLE for exploratory queries
+    - Enable turbo mode during development
+    - Scale results appropriately
+  </Card>
+</CardGroup>
+
+## Advanced Techniques
+
+### Concurrent Query Limits
+
+Snuba tracks concurrent queries per project and globally:
+
+```json
+{
+  "stats": {
+    "project_concurrent": 5,
+    "global_concurrent": 50
+  }
+}
+```
+
+High concurrency impacts performance. Consider:
+- Caching results
+- Batching queries
+- Reducing query frequency
+
+### Rate Limiting
+
+Snuba has rate limits per referrer and organization:
+
+```json
+{
+  "stats": {
+    "project_rate": 10,
+    "global_rate": 100
+  }
+}
+```
+
+Avoid rate limits by:
+- Using appropriate polling intervals
+- Caching query results
+- Batching similar queries
+
+### Allocation Policies
+
+Snuba uses allocation policies to manage resources:
+
+- **Bytes Scanned**: Rejects queries scanning too much data
+- **Concurrent Queries**: Limits parallel queries
+- **Query Duration**: May throttle long-running queries
+
+Write efficient queries to stay within policies.
+
+## Testing Query Performance
+
+When optimizing queries:
+
+1. **Enable debug mode**: See timing and generated SQL
+2. **Compare variations**: Test different approaches
+3. **Check stats**: Look for red flags (FINAL, high row counts)
+4. **Use sampling first**: Test on small data samples
+5. **Monitor production**: Track query performance over time
+
+<Note>
+  Query performance can vary based on:
+  - Time of day (concurrent load)
+  - Data volume
+  - ClickHouse cluster health
+  - Recent cache state
+  
+  Always test under realistic conditions.
+</Note>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="SnQL Syntax" icon="code" href="/query/snql">
+    Learn complete SnQL syntax
+  </Card>
+  <Card title="MQL Syntax" icon="chart-line" href="/query/mql">
+    Learn complete MQL syntax
+  </Card>
+  <Card title="Query Overview" icon="book" href="/query/overview">
+    Understand query fundamentals
+  </Card>
+</CardGroup>

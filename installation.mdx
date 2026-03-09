@@ -1,0 +1,695 @@
+---
+title: Installation
+description: Complete guide to installing Snuba using Docker, devservices, or local development setup
+---
+
+## Overview
+
+Snuba can be installed and run in several ways depending on your use case. This guide covers:
+
+- **Devservices** - Recommended for local development (easiest)
+- **Docker Compose** - Containerized deployment
+- **Local Development** - Source installation with native dependencies
+- **Production Deployment** - Production-ready configuration
+
+## Prerequisites
+
+Before installing Snuba, ensure you have the following dependencies:
+
+<Tabs>
+  <Tab title="All Methods">
+    **Required Services:**
+    - ClickHouse 25.3+
+    - Apache Kafka (with Zookeeper)
+    - Redis 4.5+
+    
+    **System Requirements:**
+    - 8GB+ RAM (16GB recommended)
+    - 4+ CPU cores
+    - 20GB+ disk space
+  </Tab>
+  
+  <Tab title="Docker">
+    - Docker 20.10+
+    - Docker Compose 2.0+
+    - 8GB+ RAM allocated to Docker
+  </Tab>
+  
+  <Tab title="Local Development">
+    - Python 3.13+
+    - Rust 1.70+ (for Rust consumers)
+    - cargo and maturin
+    - Git
+  </Tab>
+</Tabs>
+
+## Method 1: Devservices (Recommended)
+
+Devservices is the easiest way to get started with Snuba development. It automatically manages all service dependencies.
+
+<Steps>
+  <Step title="Install Devservices">
+    Install the devservices package:
+    
+    ```bash
+    pip install devservices>=1.2.1
+    ```
+    
+    <Note>
+      Devservices requires Docker to be installed and running.
+    </Note>
+  </Step>
+  
+  <Step title="Clone Snuba Repository">
+    Clone the Snuba repository and navigate to it:
+    
+    ```bash
+    git clone https://github.com/getsentry/snuba.git
+    cd snuba
+    ```
+  </Step>
+  
+  <Step title="Install Snuba Dependencies">
+    Install Snuba Python dependencies using uv or pip:
+    
+    <CodeGroup>
+    ```bash uv (Recommended)
+    # Install uv if not already installed
+    pip install uv
+    
+    # Install dependencies
+    uv sync
+    ```
+    
+    ```bash pip
+    pip install -e .
+    ```
+    </CodeGroup>
+  </Step>
+  
+  <Step title="Build Rust Components (Optional)">
+    If you need the Rust consumer functionality:
+    
+    ```bash
+    # Build rust_snuba module
+    make install-rs-dev
+    ```
+    
+    This requires:
+    - Rust toolchain (install from [rustup.rs](https://rustup.rs))
+    - maturin for building Python extensions
+    
+    <Warning>
+      Skip this step if you only need Python components. The Rust consumer is optional but recommended for better performance.
+    </Warning>
+  </Step>
+  
+  <Step title="Start Services with Devservices">
+    Start required services (ClickHouse, Kafka, Redis):
+    
+    ```bash
+    # Start minimal services
+    devservices up clickhouse kafka redis
+    
+    # Or start all services including Snuba in containers
+    devservices up --mode=containerized
+    ```
+    
+    Services will be available at:
+    - ClickHouse: `localhost:9000` (native), `localhost:8123` (HTTP)
+    - Kafka: `localhost:9093`
+    - Redis: `localhost:6379`
+  </Step>
+  
+  <Step title="Initialize Database">
+    Bootstrap Snuba and run migrations:
+    
+    ```bash
+    # Bootstrap Kafka topics and Redis
+    snuba bootstrap --force
+    
+    # Run ClickHouse migrations
+    snuba migrations migrate --force
+    ```
+  </Step>
+  
+  <Step title="Start Snuba">
+    Start the Snuba devserver:
+    
+    ```bash
+    snuba devserver
+    ```
+    
+    This starts:
+    - API server on port 1218
+    - Admin UI on port 1219
+    - All consumers and background processes
+  </Step>
+</Steps>
+
+### Verify Installation
+
+Test that Snuba is running correctly:
+
+```bash
+# Check API health
+curl http://localhost:1218/health
+
+# Should return: {"status": "ok"}
+
+# Check ClickHouse connectivity
+curl http://localhost:8123/ping
+
+# Should return: Ok.
+```
+
+## Method 2: Docker Compose
+
+For containerized deployment, use the provided Docker Compose configuration.
+
+<Steps>
+  <Step title="Clone Repository">
+    ```bash
+    git clone https://github.com/getsentry/snuba.git
+    cd snuba
+    ```
+  </Step>
+  
+  <Step title="Review Docker Compose Config">
+    The repository includes `devservices/config.yml` which defines all services:
+    
+    - `clickhouse` - ClickHouse database
+    - `snuba` - Snuba API and consumers
+    - Additional consumers for profiles, metrics, etc.
+    
+    Services are configured with:
+    - Automatic health checks
+    - Proper networking
+    - Volume mounts for data persistence
+  </Step>
+  
+  <Step title="Start Services">
+    Use devservices to start all containers:
+    
+    ```bash
+    devservices up --mode=containerized
+    ```
+    
+    Or manually with docker compose:
+    
+    ```bash
+    docker compose -f devservices/config.yml up -d
+    ```
+  </Step>
+  
+  <Step title="Initialize Database">
+    Run migrations inside the container:
+    
+    ```bash
+    docker compose -f devservices/config.yml exec snuba \
+      snuba migrations migrate --force
+    ```
+  </Step>
+</Steps>
+
+### Docker Configuration
+
+The Snuba container can be configured using environment variables:
+
+```yaml
+environment:
+  SNUBA_SETTINGS: docker
+  DEBUG: 1
+  CLICKHOUSE_HOST: clickhouse
+  CLICKHOUSE_PORT: 9000
+  CLICKHOUSE_HTTP_PORT: 8123
+  DEFAULT_BROKERS: kafka:9093
+  REDIS_HOST: redis
+  REDIS_PORT: 6379
+  REDIS_DB: 1
+  
+  # Enable optional consumers
+  ENABLE_SENTRY_METRICS_DEV: 1
+  ENABLE_PROFILES_CONSUMER: 1
+  ENABLE_ISSUE_OCCURRENCE_CONSUMER: 1
+  ENABLE_GROUP_ATTRIBUTES_CONSUMER: 1
+```
+
+### Building Custom Docker Image
+
+To build your own Snuba image:
+
+```bash
+# Build image
+docker build -t snuba:custom .
+
+# Run with custom image
+SNUBA_IMAGE=snuba:custom docker compose up
+```
+
+## Method 3: Local Development Setup
+
+For active development on Snuba itself, install from source with all development tools.
+
+<Steps>
+  <Step title="Install System Dependencies">
+    <Tabs>
+      <Tab title="macOS">
+        ```bash
+        # Install Homebrew packages
+        brew bundle
+        
+        # This installs packages from Brewfile including:
+        # - Python 3.13
+        # - Rust
+        # - Other development tools
+        ```
+      </Tab>
+      
+      <Tab title="Linux (Ubuntu/Debian)">
+        ```bash
+        # Install Python 3.13
+        sudo apt update
+        sudo apt install python3.13 python3.13-dev python3-pip
+        
+        # Install Rust
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+        
+        # Install build dependencies
+        sudo apt install build-essential libssl-dev pkg-config
+        ```
+      </Tab>
+      
+      <Tab title="Linux (Fedora/RHEL)">
+        ```bash
+        # Install Python 3.13
+        sudo dnf install python3.13 python3.13-devel
+        
+        # Install Rust
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+        
+        # Install build dependencies
+        sudo dnf install gcc gcc-c++ openssl-devel
+        ```
+      </Tab>
+    </Tabs>
+  </Step>
+  
+  <Step title="Clone and Set Up Repository">
+    ```bash
+    git clone https://github.com/getsentry/snuba.git
+    cd snuba
+    
+    # Use sentry-devenv if working on Sentry
+    # Or use make develop for standalone setup
+    make develop
+    ```
+    
+    This command:
+    - Creates a virtual environment
+    - Installs Python dependencies
+    - Builds Rust components
+    - Sets up pre-commit hooks
+  </Step>
+  
+  <Step title="Install External Services">
+    You still need ClickHouse, Kafka, and Redis. Use devservices:
+    
+    ```bash
+    devservices up clickhouse kafka redis
+    ```
+    
+    Or install them directly on your system:
+    
+    <Tabs>
+      <Tab title="macOS">
+        ```bash
+        brew install clickhouse kafka redis
+        
+        # Start services
+        brew services start clickhouse
+        brew services start kafka
+        brew services start redis
+        ```
+      </Tab>
+      
+      <Tab title="Linux">
+        Follow official installation guides:
+        - [ClickHouse Installation](https://clickhouse.com/docs/en/install)
+        - [Kafka Installation](https://kafka.apache.org/quickstart)
+        - [Redis Installation](https://redis.io/docs/getting-started/installation/)
+      </Tab>
+    </Tabs>
+  </Step>
+  
+  <Step title="Configure Snuba">
+    Create a local configuration file:
+    
+    ```bash
+    # Copy example config
+    cp config/example.yml config/local.yml
+    
+    # Edit configuration
+    vim config/local.yml
+    ```
+    
+    Minimal configuration:
+    ```yaml
+    clickhouse_host: localhost
+    clickhouse_port: 9000
+    clickhouse_http_port: 8123
+    brokers: localhost:9093
+    redis_host: localhost
+    redis_port: 6379
+    ```
+  </Step>
+  
+  <Step title="Initialize and Start">
+    ```bash
+    # Bootstrap
+    snuba bootstrap --force
+    
+    # Run migrations
+    snuba migrations migrate --force
+    
+    # Start devserver
+    snuba devserver
+    ```
+  </Step>
+</Steps>
+
+### Development Tools
+
+Snuba includes several make targets for development:
+
+```bash
+# Run tests
+make test
+
+# Run type checking
+make type-check
+
+# Build admin UI
+make build-admin
+
+# Watch and rebuild Rust on changes
+make watch-rust-snuba
+
+# Format code
+make format-rust
+
+# Generate config documentation
+make generate-config-docs
+```
+
+## Configuration
+
+### Settings Files
+
+Snuba uses different settings profiles:
+
+- `snuba.settings` - Default settings
+- `snuba.settings.docker` - Docker/container settings
+- `snuba.settings.test` - Test environment settings
+
+Set via environment variable:
+```bash
+export SNUBA_SETTINGS=docker
+```
+
+### Key Configuration Options
+
+<AccordionGroup>
+  <Accordion title="ClickHouse Connection">
+    ```python
+    # In settings.py or environment variables
+    CLICKHOUSE_HOST = "localhost"
+    CLICKHOUSE_PORT = 9000
+    CLICKHOUSE_HTTP_PORT = 8123
+    CLICKHOUSE_USER = "default"
+    CLICKHOUSE_PASSWORD = ""
+    ```
+  </Accordion>
+  
+  <Accordion title="Kafka Configuration">
+    ```python
+    DEFAULT_BROKERS = ["localhost:9093"]
+    DEFAULT_KAFKA_CONSUMER_AUTO_OFFSET_RESET = "latest"
+    ```
+  </Accordion>
+  
+  <Accordion title="Redis Configuration">
+    ```python
+    REDIS_HOST = "localhost"
+    REDIS_PORT = 6379
+    REDIS_DB = 1
+    ```
+  </Accordion>
+  
+  <Accordion title="API Server Settings">
+    ```python
+    HOST = "0.0.0.0"
+    PORT = 1218
+    API_WORKERS = 4
+    API_THREADS = 8
+    ```
+  </Accordion>
+  
+  <Accordion title="Consumer Settings">
+    ```python
+    # Enable/disable specific consumers
+    ENABLE_SENTRY_METRICS_DEV = True
+    ENABLE_PROFILES_CONSUMER = True
+    ENABLE_REPLAYS_CONSUMER = True
+    ENABLE_ISSUE_OCCURRENCE_CONSUMER = True
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Migrations
+
+Snuba uses a migration system to manage ClickHouse schema changes.
+
+### Running Migrations
+
+<CodeGroup>
+```bash Forward (Apply)
+snuba migrations migrate --force
+```
+
+```bash Reverse (Rollback)
+snuba migrations migrate --reverse --force
+```
+
+```bash Specific Migration
+snuba migrations run --group events --migration 0001_events_initial
+```
+
+```bash Check Status
+snuba migrations list
+```
+</CodeGroup>
+
+### Migration Groups
+
+Migrations are organized by dataset/storage:
+
+- `events` - Events/errors storage
+- `transactions` - Transaction storage
+- `metrics` - Metrics storage
+- `profiles` - Profiling storage
+- `replays` - Replay storage
+- `search_issues` - Issue search storage
+
+<Warning>
+  Always run migrations in a test environment first. Some migrations may be irreversible or require significant time to complete.
+</Warning>
+
+## Verification
+
+After installation, verify that everything is working:
+
+<Steps>
+  <Step title="Check Service Health">
+    ```bash
+    # Snuba API
+    curl http://localhost:1218/health
+    
+    # ClickHouse
+    curl http://localhost:8123/ping
+    
+    # Redis
+    redis-cli ping
+    ```
+  </Step>
+  
+  <Step title="Test Query Execution">
+    ```bash
+    curl -X POST http://localhost:1218/events/snql \
+      -H 'Content-Type: application/json' \
+      -d '{
+        "query": "MATCH (events) SELECT count() AS cnt WHERE timestamp >= toDateTime('"'2024-01-01T00:00:00'"') AND timestamp < toDateTime('"'2024-12-31T23:59:59'"') AND project_id = 1",
+        "dataset": "events"
+      }'
+    ```
+  </Step>
+  
+  <Step title="Check Admin UI">
+    Open http://localhost:1219 in your browser to access the admin interface.
+  </Step>
+  
+  <Step title="Verify Consumers">
+    If running devserver, check that consumers are running:
+    
+    ```bash
+    # Should see multiple consumer processes
+    ps aux | grep "snuba rust-consumer"
+    ```
+  </Step>
+</Steps>
+
+## Production Deployment
+
+For production deployments, consider the following:
+
+### Scaling Considerations
+
+<CardGroup cols={2}>
+  <Card title="API Servers" icon="server">
+    Run multiple API server instances behind a load balancer. Configure workers and threads based on CPU cores:
+    
+    ```bash
+    snuba api --processes=4 --threads=8
+    ```
+  </Card>
+  
+  <Card title="Consumer Replicas" icon="users">
+    Run multiple consumer instances for high throughput. Adjust batch timing based on replica count:
+    
+    ```bash
+    # With 12 replicas, use 12 second batches
+    --max-batch-time-ms=12000
+    ```
+  </Card>
+  
+  <Card title="ClickHouse Cluster" icon="database">
+    Use distributed ClickHouse setup with:
+    - Multiple shards for horizontal scaling
+    - Replication for high availability
+    - Separate keeper/zookeeper cluster
+  </Card>
+  
+  <Card title="Monitoring" icon="chart-line">
+    Implement monitoring for:
+    - Consumer lag
+    - Query latency
+    - ClickHouse performance
+    - Error rates
+  </Card>
+</CardGroup>
+
+### Resource Requirements
+
+Production resource recommendations:
+
+| Component | CPU | Memory | Disk |
+|-----------|-----|--------|------|
+| API Server | 4+ cores | 8GB+ | 20GB |
+| Consumer | 2+ cores | 4GB+ | 20GB |
+| ClickHouse | 8+ cores | 32GB+ | SSD, size depends on data retention |
+| Kafka | 4+ cores | 8GB+ | 500GB+ |
+| Redis | 2+ cores | 4GB+ | 10GB |
+
+### Security
+
+<Warning>
+  For production deployments:
+  - Enable authentication on ClickHouse
+  - Use TLS for all connections
+  - Configure firewall rules
+  - Set up proper access controls
+  - Use secrets management for credentials
+</Warning>
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="ClickHouse Connection Timeout">
+    **Symptoms:** `Connection timeout` or `Connection refused` errors
+    
+    **Solutions:**
+    - Verify ClickHouse is running: `curl http://localhost:8123/ping`
+    - Check ClickHouse logs: `docker logs clickhouse`
+    - Ensure correct host/port in configuration
+    - Check firewall rules
+  </Accordion>
+  
+  <Accordion title="Kafka Consumer Lag">
+    **Symptoms:** Slow data ingestion, growing consumer lag
+    
+    **Solutions:**
+    - Increase consumer replicas
+    - Reduce batch time
+    - Check ClickHouse write performance
+    - Monitor ClickHouse insert rate (should be ~1/sec per shard)
+  </Accordion>
+  
+  <Accordion title="Migration Failures">
+    **Symptoms:** Migration commands fail or hang
+    
+    **Solutions:**
+    - Check ClickHouse connectivity
+    - Review migration logs for errors
+    - Ensure no other migrations are running
+    - For hung migrations, check ClickHouse for long-running queries
+  </Accordion>
+  
+  <Accordion title="Out of Memory Errors">
+    **Symptoms:** Python or ClickHouse OOM errors
+    
+    **Solutions:**
+    - Increase memory allocation
+    - Reduce batch sizes for consumers
+    - Limit query complexity and row count
+    - Configure ClickHouse memory limits
+  </Accordion>
+  
+  <Accordion title="Rust Build Failures">
+    **Symptoms:** `make install-rs-dev` fails
+    
+    **Solutions:**
+    - Install Rust: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
+    - Update Rust: `rustup update`
+    - Install maturin: `pip install maturin`
+    - Check for build dependencies
+  </Accordion>
+</AccordionGroup>
+
+## Next Steps
+
+Now that you have Snuba installed:
+
+<CardGroup cols={2}>
+  <Card title="Quickstart Guide" icon="rocket" href="/quickstart">
+    Learn how to execute your first queries and explore Snuba's features
+  </Card>
+  
+  <Card title="Configuration Guide" icon="gear">
+    Deep dive into configuring datasets, entities, and query processors
+  </Card>
+  
+  <Card title="API Reference" icon="code">
+    Complete reference for the HTTP API and query endpoints
+  </Card>
+  
+  <Card title="Operations Guide" icon="wrench">
+    Best practices for monitoring, scaling, and maintaining Snuba
+  </Card>
+</CardGroup>
+
+## Additional Resources
+
+- [Snuba GitHub Repository](https://github.com/getsentry/snuba)
+- [ClickHouse Documentation](https://clickhouse.com/docs)
+- [Kafka Documentation](https://kafka.apache.org/documentation/)
+- [Sentry Documentation](https://docs.sentry.io)

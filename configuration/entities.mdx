@@ -1,0 +1,613 @@
+---
+title: Entity Configuration
+description: Configure Snuba entities to define logical data models, schemas, and query processing
+---
+
+Entities represent logical data models in Snuba. They define schemas, connect to storage backends, and configure query processing, validation, and translation rules.
+
+## Overview
+
+An entity configuration defines:
+
+- **Schema**: Column definitions and data types
+- **Storage connections**: Which physical storages back this entity
+- **Storage selector**: Logic to choose between multiple storages
+- **Query processors**: Query transformations and optimizations
+- **Validators**: Query validation and security rules
+- **Translation mappers**: Column and function name mappings
+- **Subscription rules**: Real-time subscription configuration
+
+## Schema Reference
+
+<ParamField path="version" type="string" required>
+  Schema version. Must be `v1`.
+</ParamField>
+
+<ParamField path="kind" type="string" required>
+  Component type. Must be `entity`.
+</ParamField>
+
+<ParamField path="name" type="string" required>
+  Unique name for the entity.
+</ParamField>
+
+<ParamField path="schema" type="array" required>
+  Array of column definitions. Each column specifies name, type, and optional args.
+</ParamField>
+
+<ParamField path="storages" type="array" required>
+  Array of storage connections with optional translation mappers.
+</ParamField>
+
+<ParamField path="storage_selector" type="object" required>
+  Configuration for the storage selector class.
+</ParamField>
+
+<ParamField path="query_processors" type="array" required>
+  Array of query processor configurations.
+</ParamField>
+
+<ParamField path="validators" type="array" required>
+  Array of validator configurations.
+</ParamField>
+
+<ParamField path="required_time_column" type="string" required>
+  Name of the time column used for time-based queries.
+</ParamField>
+
+<ParamField path="translation_mappers" type="object">
+  Translation rules for columns, functions, and subscriptables.
+</ParamField>
+
+<ParamField path="validate_data_model" type="string">
+  Validation mode: `do_nothing`, `warn`, or `error`.
+</ParamField>
+
+<ParamField path="partition_key_column_name" type="string">
+  Column name for partition-based query routing.
+</ParamField>
+
+<ParamField path="subscription_processors" type="array">
+  Array of subscription processor configurations.
+</ParamField>
+
+<ParamField path="subscription_validators" type="array">
+  Array of subscription validator configurations.
+</ParamField>
+
+<ParamField path="join_relationships" type="object">
+  Definitions for entity joins in multi-entity queries.
+</ParamField>
+
+## Basic Example
+
+A minimal entity configuration:
+
+```yaml entity.yaml
+version: v1
+kind: entity
+name: events
+
+schema:
+  - name: project_id
+    type: UInt
+    args:
+      size: 64
+  - name: timestamp
+    type: DateTime
+  - name: event_id
+    type: UUID
+  - name: message
+    type: String
+
+required_time_column: timestamp
+
+storages:
+  - storage: errors
+    is_writable: true
+
+storage_selector:
+  selector: SimpleQueryStorageSelector
+  args:
+    storage: errors
+
+query_processors: []
+
+validators:
+  - validator: EntityRequiredColumnValidator
+    args:
+      required_filter_columns:
+        - project_id
+```
+
+## Schema Definition
+
+### Column Types
+
+Define columns with name, type, and optional arguments:
+
+<CodeGroup>
+```yaml Simple Types
+schema:
+  - name: project_id
+    type: UInt
+    args:
+      size: 64
+      
+  - name: timestamp
+    type: DateTime
+    
+  - name: event_id
+    type: UUID
+    
+  - name: message
+    type: String
+```
+
+```yaml Nullable Columns
+schema:
+  - name: environment
+    type: String
+    args:
+      schema_modifiers: [nullable]
+      
+  - name: user_id
+    type: String
+    args:
+      schema_modifiers: [nullable]
+```
+
+```yaml Arrays and Nested
+schema:
+  - name: sdk_integrations
+    type: Array
+    args:
+      inner_type:
+        type: String
+        
+  - name: tags
+    type: Nested
+    args:
+      subcolumns:
+        - name: key
+          type: String
+        - name: value
+          type: String
+```
+
+```yaml Complex Types
+schema:
+  - name: timestamp_ms
+    type: DateTime64
+    args:
+      precision: 3
+      schema_modifiers: [nullable]
+      
+  - name: sample_weight
+    type: Float
+    args:
+      size: 64
+      schema_modifiers: [nullable]
+      
+  - name: deleted
+    type: UInt
+    args:
+      size: 8
+```
+</CodeGroup>
+
+### Schema Modifiers
+
+Available schema modifiers:
+
+- `nullable` - Column can contain NULL values
+- `readonly` - Computed/derived column, not directly writable
+- `lowcardinality` - Optimized for columns with few distinct values
+
+## Storage Connections
+
+Entities can connect to multiple storages:
+
+```yaml Multiple Storages
+storages:
+  - storage: errors_ro
+    is_writable: false
+    translation_mappers:
+      columns:
+        - mapper: ColumnToColumn
+          args:
+            from_table_name: null
+            from_col_name: username
+            to_table_name: null
+            to_col_name: user_name
+      subscriptables:
+        - mapper: SubscriptableMapper
+          args:
+            from_column_name: tags
+            to_nested_col_name: tags
+            value_subcolumn_name: value
+            nullable: false
+            
+  - storage: errors
+    is_writable: true
+    translation_mappers:
+      columns:
+        - mapper: ColumnToColumn
+          args:
+            from_table_name: null
+            from_col_name: username
+            to_table_name: null
+            to_col_name: user_name
+```
+
+### Storage Selection
+
+The storage selector determines which storage to query:
+
+<CodeGroup>
+```yaml Simple Selector
+storage_selector:
+  selector: SimpleQueryStorageSelector
+  args:
+    storage: errors
+```
+
+```yaml Conditional Selector
+storage_selector:
+  selector: ErrorsQueryStorageSelector
+  # Selects between read-only and writable storage
+  # based on query requirements
+```
+</CodeGroup>
+
+## Translation Mappers
+
+Translation mappers convert between entity columns and storage columns:
+
+### Column Mappers
+
+<CodeGroup>
+```yaml Column to Column
+translation_mappers:
+  columns:
+    - mapper: ColumnToColumn
+      args:
+        from_table_name: null
+        from_col_name: transaction
+        to_table_name: null
+        to_col_name: transaction_name
+```
+
+```yaml Column to Mapping
+translation_mappers:
+  columns:
+    - mapper: ColumnToMapping
+      args:
+        from_col_name: release
+        to_nested_col_name: tags
+        to_nested_mapping_key: sentry:release
+        nullable: false
+```
+
+```yaml Column to IP Address
+translation_mappers:
+  columns:
+    - mapper: ColumnToIPAddress
+      args:
+        from_col_name: ip_address
+```
+</CodeGroup>
+
+### Function Mappers
+
+```yaml Function Mappers
+translation_mappers:
+  functions:
+    - mapper: FunctionMapper
+      args:
+        from_name: count_unique
+        to_name: uniq
+```
+
+### Subscriptable Mappers
+
+Handle subscript operations like `tags[key]`:
+
+```yaml Subscriptable Mappers
+translation_mappers:
+  subscriptables:
+    - mapper: SubscriptableMapper
+      args:
+        from_column_name: tags
+        to_nested_col_name: tags
+        value_subcolumn_name: value
+        nullable: false
+        
+    - mapper: SubscriptableMapper
+      args:
+        from_column_name: contexts
+        to_nested_col_name: contexts
+        value_subcolumn_name: value
+        nullable: false
+```
+
+## Query Processors
+
+Query processors transform queries before execution:
+
+```yaml Query Processors
+query_processors:
+  - processor: TimeSeriesProcessor
+    args:
+      time_group_columns:
+        time: timestamp
+        rtime: received
+      time_parse_columns:
+        - timestamp
+        - received
+        
+  - processor: BasicFunctionsProcessor
+  
+  - processor: HandledFunctionsProcessor
+    args:
+      column: exception_stacks.mechanism_handled
+```
+
+### Common Query Processors
+
+<AccordionGroup>
+  <Accordion title="TimeSeriesProcessor">
+    Handles time-based queries, granularity, and time grouping.
+    
+    ```yaml
+    - processor: TimeSeriesProcessor
+      args:
+        time_group_columns:
+          time: timestamp
+          rtime: received
+        time_parse_columns:
+          - timestamp
+          - received
+    ```
+  </Accordion>
+
+  <Accordion title="BasicFunctionsProcessor">
+    Translates basic function calls to ClickHouse equivalents.
+    
+    ```yaml
+    - processor: BasicFunctionsProcessor
+    ```
+  </Accordion>
+
+  <Accordion title="HandledFunctionsProcessor">
+    Processes error handled/unhandled function calls.
+    
+    ```yaml
+    - processor: HandledFunctionsProcessor
+      args:
+        column: exception_stacks.mechanism_handled
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Validators
+
+Validators enforce query constraints and security rules:
+
+```yaml Validators
+validators:
+  - validator: EntityRequiredColumnValidator
+    args:
+      required_filter_columns:
+        - project_id
+        
+  - validator: TagConditionValidator
+    args: {}
+    
+  - validator: DatetimeConditionValidator
+    args: {}
+```
+
+### Common Validators
+
+<AccordionGroup>
+  <Accordion title="EntityRequiredColumnValidator">
+    Ensures required columns are filtered in WHERE clause.
+    
+    ```yaml
+    - validator: EntityRequiredColumnValidator
+      args:
+        required_filter_columns:
+          - project_id
+          - organization_id
+    ```
+  </Accordion>
+
+  <Accordion title="TagConditionValidator">
+    Validates tag filter conditions.
+    
+    ```yaml
+    - validator: TagConditionValidator
+      args: {}
+    ```
+  </Accordion>
+
+  <Accordion title="DatetimeConditionValidator">
+    Ensures datetime ranges are reasonable.
+    
+    ```yaml
+    - validator: DatetimeConditionValidator
+      args: {}
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Subscription Configuration
+
+Configure real-time query subscriptions:
+
+```yaml Subscription Config
+subscription_validators:
+  - validator: AggregationValidator
+    args:
+      max_allowed_aggregations: 10
+      disallowed_aggregations:
+        - having
+        - orderby
+      required_time_column: timestamp
+      allows_group_by_without_condition: true
+```
+
+See [Subscription Configuration](/configuration/subscriptions) for details.
+
+## Join Relationships
+
+Define relationships for multi-entity queries:
+
+```yaml Join Relationships
+join_relationships:
+  grouped:
+    rhs_entity: groupedmessage
+    join_type: inner
+    columns:
+      - [project_id, project_id]
+      - [group_id, id]
+      
+  assigned:
+    rhs_entity: groupassignee
+    join_type: inner
+    columns:
+      - [project_id, project_id]
+      - [group_id, group_id]
+      
+  attributes:
+    rhs_entity: group_attributes
+    join_type: left
+    columns:
+      - [project_id, project_id]
+      - [group_id, group_id]
+```
+
+### Join Types
+
+- `inner` - Inner join (only matching rows)
+- `left` - Left outer join (all rows from left side)
+
+## Complete Example
+
+A full entity configuration for events:
+
+```yaml events.yaml
+version: v1
+kind: entity
+name: events
+
+schema:
+  - name: project_id
+    type: UInt
+    args:
+      size: 64
+  - name: timestamp
+    type: DateTime
+  - name: event_id
+    type: UUID
+  - name: message
+    type: String
+  - name: platform
+    type: String
+  - name: environment
+    type: String
+    args:
+      schema_modifiers: [nullable]
+  - name: tags
+    type: Nested
+    args:
+      subcolumns:
+        - name: key
+          type: String
+        - name: value
+          type: String
+
+required_time_column: timestamp
+
+storages:
+  - storage: errors
+    is_writable: true
+    translation_mappers:
+      columns:
+        - mapper: ColumnToMapping
+          args:
+            from_col_name: release
+            to_nested_col_name: tags
+            to_nested_mapping_key: sentry:release
+            nullable: false
+      subscriptables:
+        - mapper: SubscriptableMapper
+          args:
+            from_column_name: tags
+            to_nested_col_name: tags
+            value_subcolumn_name: value
+            nullable: false
+
+storage_selector:
+  selector: ErrorsQueryStorageSelector
+
+query_processors:
+  - processor: TimeSeriesProcessor
+    args:
+      time_group_columns:
+        time: timestamp
+      time_parse_columns:
+        - timestamp
+  - processor: BasicFunctionsProcessor
+
+validators:
+  - validator: EntityRequiredColumnValidator
+    args:
+      required_filter_columns:
+        - project_id
+  - validator: DatetimeConditionValidator
+    args: {}
+
+validate_data_model: error
+
+subscription_validators:
+  - validator: AggregationValidator
+    args:
+      max_allowed_aggregations: 10
+      required_time_column: timestamp
+```
+
+## Best Practices
+
+<CardGroup cols={2}>
+  <Card title="Security First" icon="shield">
+    Always include required column validators for multi-tenant data (project_id, organization_id).
+  </Card>
+  
+  <Card title="Translation Consistency" icon="language">
+    Keep translation mappers consistent across all storages connected to an entity.
+  </Card>
+  
+  <Card title="Optimize Queries" icon="gauge-high">
+    Use query processors to optimize common query patterns and improve performance.
+  </Card>
+  
+  <Card title="Document Schema" icon="file-lines">
+    Add YAML comments to explain complex schema structures and column purposes.
+  </Card>
+</CardGroup>
+
+## Related Configuration
+
+<CardGroup cols={3}>
+  <Card title="Datasets" icon="database" href="/configuration/datasets">
+    Group entities into datasets
+  </Card>
+  <Card title="Storages" icon="hard-drive" href="/configuration/storages">
+    Configure storage backends
+  </Card>
+  <Card title="Subscriptions" icon="bell" href="/configuration/subscriptions">
+    Set up real-time subscriptions
+  </Card>
+</CardGroup>

@@ -1,0 +1,272 @@
+---
+title: Configuration System Overview
+description: Learn how Snuba's YAML-based configuration system works for datasets, entities, storages, and subscriptions
+---
+
+Snuba uses a declarative YAML-based configuration system to define datasets, entities, storages, and subscriptions. This approach allows for flexible, maintainable configuration of the data layer without requiring code changes.
+
+## Architecture
+
+The configuration system is built around four primary components:
+
+<CardGroup cols={2}>
+  <Card title="Datasets" icon="database" href="/configuration/datasets">
+    Top-level organizational units that group related entities
+  </Card>
+  <Card title="Entities" icon="cube" href="/configuration/entities">
+    Logical data models that define schemas and query logic
+  </Card>
+  <Card title="Storages" icon="hard-drive" href="/configuration/storages">
+    Physical data storage abstractions (ClickHouse tables)
+  </Card>
+  <Card title="Subscriptions" icon="bell" href="/configuration/subscriptions">
+    Real-time query subscriptions with validation rules
+  </Card>
+</CardGroup>
+
+## Configuration Files
+
+Configuration files are located in the `snuba/datasets/configuration/` directory and organized by dataset:
+
+```bash
+snuba/datasets/configuration/
+├── events/
+│   ├── dataset.yaml           # Dataset definition
+│   ├── entities/
+│   │   └── events.yaml        # Entity definitions
+│   └── storages/
+│       ├── errors.yaml        # Writable storage
+│       └── errors_ro.yaml     # Readable storage
+├── discover/
+├── metrics/
+└── ...
+```
+
+## Schema Version
+
+All configuration files use version `v1` and must specify:
+
+<ParamField path="version" type="string" required>
+  Schema version. Currently always `v1`.
+</ParamField>
+
+<ParamField path="kind" type="string" required>
+  Component type: `dataset`, `entity`, `readable_storage`, `writable_storage`, or `cdc_storage`.
+</ParamField>
+
+<ParamField path="name" type="string" required>
+  Unique identifier for the component.
+</ParamField>
+
+## Configuration Loading
+
+Snuba loads and validates configuration files at startup using JSON Schema validation. The loading process:
+
+1. **Discovery**: Scans configuration directories for YAML files
+2. **Parsing**: Parses YAML into Python dictionaries
+3. **Validation**: Validates against JSON schemas defined in `json_schema.py`
+4. **Building**: Constructs Python objects from validated configuration
+5. **Registration**: Registers components in the global registry
+
+<Note>
+Configuration validation is controlled by the `VALIDATE_DATASET_YAMLS_ON_STARTUP` setting. In production, validation is enabled to catch errors early.
+</Note>
+
+## Configuration Validation
+
+The system validates configurations using `fastjsonschema` for performance:
+
+```python
+from snuba.datasets.configuration.loader import load_configuration_data
+from snuba.datasets.configuration.json_schema import ENTITY_VALIDATORS
+
+# Load and validate entity configuration
+config = load_configuration_data(
+    "path/to/entity.yaml",
+    ENTITY_VALIDATORS
+)
+```
+
+### Validation Errors
+
+Common validation errors include:
+
+- **Missing required fields**: All required properties must be present
+- **Invalid types**: Values must match the expected type (string, integer, array, etc.)
+- **Unknown properties**: Additional properties not defined in the schema
+- **Invalid references**: References to non-existent storages, processors, or validators
+
+## Builder Pattern
+
+Configuration files are transformed into Python objects using builder functions:
+
+<CodeGroup>
+```python Dataset Builder
+from snuba.datasets.configuration.dataset_builder import build_dataset_from_config
+
+dataset = build_dataset_from_config("events/dataset.yaml")
+```
+
+```python Entity Builder
+from snuba.datasets.configuration.entity_builder import build_entity_from_config
+
+entity = build_entity_from_config("events/entities/events.yaml")
+```
+
+```python Storage Builder
+from snuba.datasets.configuration.storage_builder import build_storage_from_config
+
+storage = build_storage_from_config("events/storages/errors.yaml")
+```
+</CodeGroup>
+
+## Registered Classes
+
+Many configuration properties reference registered Python classes:
+
+- **Query Processors**: Transform queries before execution
+- **Validators**: Enforce query constraints and security rules
+- **Mappers**: Translate column and function names
+- **Storage Selectors**: Choose which storage to query
+- **Allocation Policies**: Control resource allocation per query
+
+These classes are registered using decorators:
+
+```python
+from snuba.query.processors.logical import LogicalQueryProcessor
+
+@LogicalQueryProcessor.register("TimeSeriesProcessor")
+class TimeSeriesProcessor(LogicalQueryProcessor):
+    def process_query(self, query, query_settings):
+        # Transform query logic
+        ...
+```
+
+## Column Schemas
+
+Columns are defined with a consistent structure across all components:
+
+```yaml
+schema:
+  - name: project_id
+    type: UInt
+    args:
+      size: 64
+  - name: timestamp
+    type: DateTime
+  - name: tags
+    type: Nested
+    args:
+      subcolumns:
+        - name: key
+          type: String
+        - name: value
+          type: String
+```
+
+### Supported Column Types
+
+<AccordionGroup>
+  <Accordion title="Numeric Types">
+    - `UInt` - Unsigned integers (8, 16, 32, 64 bit)
+    - `Int` - Signed integers (8, 16, 32, 64 bit)
+    - `Float` - Floating point (32, 64 bit)
+  </Accordion>
+
+  <Accordion title="String Types">
+    - `String` - Variable-length strings
+    - `FixedString` - Fixed-length strings
+  </Accordion>
+
+  <Accordion title="Date/Time Types">
+    - `DateTime` - Unix timestamp with second precision
+    - `DateTime64` - Unix timestamp with configurable precision
+    - `Date` - Calendar date
+  </Accordion>
+
+  <Accordion title="Complex Types">
+    - `Array` - Arrays of any supported type
+    - `Nested` - Nested structures (like arrays of structs)
+    - `Map` - Key-value mappings
+    - `Tuple` - Fixed-size tuples
+    - `JSON` - JSON objects (ClickHouse experimental)
+  </Accordion>
+
+  <Accordion title="Special Types">
+    - `UUID` - Universally unique identifiers
+    - `IPv4` / `IPv6` - IP addresses
+    - `Enum` - Enumeration types
+    - `AggregateFunction` - Aggregation state
+    - `SimpleAggregateFunction` - Simple aggregation state
+  </Accordion>
+</AccordionGroup>
+
+## Schema Modifiers
+
+Columns can have schema modifiers:
+
+<ParamField path="schema_modifiers" type="array">
+  Array of modifiers that affect column behavior:
+  
+  - `nullable` - Column can contain NULL values
+  - `readonly` - Column is computed/derived, not directly writable
+  - `lowcardinality` - Optimize for columns with few distinct values
+</ParamField>
+
+Example:
+
+```yaml
+- name: environment
+  type: String
+  args:
+    schema_modifiers: [nullable]
+```
+
+## Best Practices
+
+<AccordionGroup>
+  <Accordion title="Organization">
+    - Keep related configurations in the same directory
+    - Use consistent naming conventions (`dataset_name`, `entity_name`)
+    - Document complex configurations with YAML comments
+    - Separate read-only and writable storages
+  </Accordion>
+
+  <Accordion title="Validation">
+    - Always validate configurations locally before deploying
+    - Use descriptive names for query processors and validators
+    - Test configuration changes with integration tests
+    - Monitor startup logs for validation warnings
+  </Accordion>
+
+  <Accordion title="Performance">
+    - Configure appropriate allocation policies
+    - Use query processors to optimize common patterns
+    - Set up proper indexes in storage schemas
+    - Enable PREWHERE optimization where applicable
+  </Accordion>
+
+  <Accordion title="Security">
+    - Always include mandatory condition checkers
+    - Enforce project_id filtering on multi-tenant storages
+    - Use validators to prevent expensive queries
+    - Configure rate limits via allocation policies
+  </Accordion>
+</AccordionGroup>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Configure Datasets" icon="database" href="/configuration/datasets">
+    Learn how to define and organize datasets
+  </Card>
+  <Card title="Configure Entities" icon="cube" href="/configuration/entities">
+    Create entity schemas and query logic
+  </Card>
+  <Card title="Configure Storages" icon="hard-drive" href="/configuration/storages">
+    Set up ClickHouse storage abstractions
+  </Card>
+  <Card title="Configure Subscriptions" icon="bell" href="/configuration/subscriptions">
+    Define subscription validation rules
+  </Card>
+</CardGroup>

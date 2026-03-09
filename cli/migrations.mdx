@@ -1,0 +1,716 @@
+---
+title: "Migration Commands"
+description: "Manage ClickHouse schema migrations and database changes"
+---
+
+## Overview
+
+Snuba uses a migration system to manage ClickHouse database schema changes. The migration commands provide tools for listing, running, and reverting migrations across different storage groups.
+
+Migrations are organized into **migration groups** that correspond to different parts of the system (e.g., `events`, `transactions`, `system`). Each migration group can have its own readiness state that determines when it should be applied.
+
+## Main Command
+
+```bash
+snuba migrations [SUBCOMMAND] [OPTIONS]
+```
+
+The migrations command provides several subcommands for different operations.
+
+## Subcommands
+
+### list
+
+Lists all migrations and their current status across all migration groups.
+
+```bash
+snuba migrations list
+```
+
+This command displays:
+- All migration groups with their readiness states
+- Migration IDs within each group
+- Status indicators:
+  - `[X]` - Completed
+  - `[ ]` - Not started
+  - `[-]` - In progress
+- Blocking status for incomplete migrations
+- Warnings for migrations that no longer exist in code
+
+#### Example Output
+
+```bash
+events (readiness_state: complete)
+[X]  0001_events_initial
+[X]  0002_events_onpremise_compatibility
+[X]  0003_errors
+[ ]  0004_add_new_column (blocking)
+
+transactions (readiness_state: limited)
+[X]  0001_transactions
+[X]  0002_transactions_onpremise_compatibility
+
+system (readiness_state: complete)
+[X]  0001_migrations
+```
+
+### migrate
+
+Runs pending migrations for a specific group or all groups.
+
+```bash
+snuba migrations migrate [OPTIONS] [THROUGH]
+```
+
+<ParamField path="THROUGH" type="string" default="all">
+  Run migrations up to and including this migration ID. Use `"all"` to run all pending migrations.
+</ParamField>
+
+<ParamField path="--group" type="string">
+  Migration group to run migrations for. If not specified, runs migrations for all groups.
+  
+  Common groups:
+  - `system` - Core system tables
+  - `events` - Error events storage
+  - `transactions` - Transaction events storage
+  - `outcomes` - Outcomes/billing data
+  - `sessions` - Session data
+  - `metrics` - Metrics storage
+</ParamField>
+
+<ParamField path="--readiness-state" type="choice" multiple>
+  Only run migrations for groups with specific readiness states. Can be specified multiple times.
+  
+  Available states:
+  - `complete` - Fully ready for production
+  - `limited` - Limited availability
+  - `experimental` - Experimental features
+  - `partial` - Partially implemented
+</ParamField>
+
+<ParamField path="--force" type="flag">
+  Force running of blocking migrations. Required for migrations marked as blocking.
+</ParamField>
+
+<ParamField path="--fake" type="flag">
+  Mark migrations as completed without actually running them. Useful for fixing migration state.
+</ParamField>
+
+<ParamField path="--check-dangerous" type="flag">
+  Check for dangerous operations (like dropping tables or columns) and require confirmation.
+</ParamField>
+
+<ParamField path="--log-level" type="choice">
+  Logging level (critical, error, warning, info, debug, notset).
+</ParamField>
+
+#### Examples
+
+<CodeGroup>
+```bash Run All Migrations
+# Run all pending migrations across all groups
+snuba migrations migrate --force
+```
+
+```bash Specific Group
+# Run migrations only for events group
+snuba migrations migrate --group events --force
+```
+
+```bash Up to Specific Migration
+# Run up to a specific migration in transactions group
+snuba migrations migrate --group transactions 0005_add_span_id --force
+```
+
+```bash By Readiness State
+# Only migrate complete and limited groups
+snuba migrations migrate \
+  --readiness-state complete \
+  --readiness-state limited \
+  --force
+```
+
+```bash Fake Migration
+# Mark migration as complete without running
+snuba migrations migrate --group events 0004_already_applied --fake --force
+```
+</CodeGroup>
+
+<Warning>
+  Blocking migrations require the `--force` flag as they may contain dangerous operations or require downtime. Always review blocking migrations before applying.
+</Warning>
+
+### run
+
+Runs a single specific migration.
+
+```bash
+snuba migrations run [OPTIONS]
+```
+
+<ParamField path="--group" type="string" required>
+  Migration group containing the migration.
+</ParamField>
+
+<ParamField path="--migration-id" type="string" required>
+  ID of the migration to run.
+</ParamField>
+
+<ParamField path="--force" type="flag">
+  Required to run blocking migrations.
+</ParamField>
+
+<ParamField path="--fake" type="flag">
+  Mark migration as completed without running. Requires confirmation unless `--yes` is also passed.
+</ParamField>
+
+<ParamField path="--dry-run" type="flag">
+  Show what SQL would be executed without actually running it.
+</ParamField>
+
+<ParamField path="--yes" type="flag">
+  Skip confirmation prompts (use with caution).
+</ParamField>
+
+<ParamField path="--check-dangerous" type="flag">
+  Check for dangerous operations and require confirmation.
+</ParamField>
+
+<ParamField path="--log-level" type="choice">
+  Logging level to use.
+</ParamField>
+
+#### Examples
+
+<CodeGroup>
+```bash Run Single Migration
+# Run a specific migration
+snuba migrations run \
+  --group events \
+  --migration-id 0004_add_new_column \
+  --force
+```
+
+```bash Dry Run
+# Preview SQL without executing
+snuba migrations run \
+  --group transactions \
+  --migration-id 0006_add_index \
+  --dry-run
+```
+
+```bash Fake Migration
+# Mark as complete without running (with confirmation)
+snuba migrations run \
+  --group events \
+  --migration-id 0003_already_applied \
+  --fake
+```
+
+```bash Fake Without Confirmation
+# Skip confirmation prompt
+snuba migrations run \
+  --group events \
+  --migration-id 0003_already_applied \
+  --fake \
+  --yes
+```
+</CodeGroup>
+
+<Note>
+  Migrations that are already in progress or completed will not be run again. Use `--fake` to fix migration state if needed.
+</Note>
+
+### revert
+
+Reverses migrations for a group, running them backwards.
+
+```bash
+snuba migrations revert [OPTIONS] [THROUGH]
+```
+
+<ParamField path="THROUGH" type="string" default="all">
+  Revert migrations back to and including this migration ID. Use `"all"` to revert all migrations.
+</ParamField>
+
+<ParamField path="--group" type="string">
+  Migration group to revert migrations for. If not specified, reverts migrations for all groups.
+</ParamField>
+
+<ParamField path="--readiness-state" type="choice" multiple>
+  Only revert migrations for groups with specific readiness states.
+</ParamField>
+
+<ParamField path="--force" type="flag" required>
+  Required to perform revert operations.
+</ParamField>
+
+<ParamField path="--fake" type="flag">
+  Mark migrations as reverted without actually running the reverse operations.
+</ParamField>
+
+<ParamField path="--include-system" type="flag">
+  Also revert SYSTEM migrations. By default, system migrations are NOT reversed.
+</ParamField>
+
+<ParamField path="--log-level" type="choice">
+  Logging level to use.
+</ParamField>
+
+#### Examples
+
+<CodeGroup>
+```bash Revert Group
+# Revert all migrations in events group
+snuba migrations revert --group events --force
+```
+
+```bash Revert to Specific Migration
+# Revert back to (and including) a specific migration
+snuba migrations revert --group transactions 0005_add_span_id --force
+```
+
+```bash Revert All Groups
+# Revert migrations for all groups (except system)
+snuba migrations revert --force
+```
+
+```bash Include System Migrations
+# Revert all migrations including system tables
+snuba migrations revert --include-system --force
+```
+</CodeGroup>
+
+<Warning>
+  Reverting migrations can result in data loss. Always backup data before reverting migrations. The `--force` flag is required to prevent accidental reverts.
+</Warning>
+
+### reverse
+
+Reverses a single specific migration.
+
+```bash
+snuba migrations reverse [OPTIONS]
+```
+
+<ParamField path="--group" type="string" required>
+  Migration group containing the migration.
+</ParamField>
+
+<ParamField path="--migration-id" type="string" required>
+  ID of the migration to reverse.
+</ParamField>
+
+<ParamField path="--force" type="flag" required>
+  Required to reverse an already completed migration.
+</ParamField>
+
+<ParamField path="--fake" type="flag">
+  Mark migration as reversed without running. Requires confirmation unless `--yes` is passed.
+</ParamField>
+
+<ParamField path="--dry-run" type="flag">
+  Show what SQL would be executed without running it.
+</ParamField>
+
+<ParamField path="--yes" type="flag">
+  Skip confirmation prompts.
+</ParamField>
+
+<ParamField path="--log-level" type="choice">
+  Logging level to use.
+</ParamField>
+
+#### Examples
+
+<CodeGroup>
+```bash Reverse Single Migration
+# Reverse a specific migration
+snuba migrations reverse \
+  --group events \
+  --migration-id 0004_add_new_column \
+  --force
+```
+
+```bash Dry Run Reverse
+# Preview reverse SQL
+snuba migrations reverse \
+  --group transactions \
+  --migration-id 0006_add_index \
+  --dry-run
+```
+
+```bash Fake Reverse
+# Mark as reversed without running
+snuba migrations reverse \
+  --group events \
+  --migration-id 0003_bad_state \
+  --fake \
+  --force
+```
+</CodeGroup>
+
+### reverse-in-progress
+
+Reverses any migrations currently in an "in progress" state.
+
+```bash
+snuba migrations reverse-in-progress [OPTIONS]
+```
+
+<ParamField path="--group" type="string">
+  Only reverse in-progress migrations for this group. If not specified, checks all groups.
+</ParamField>
+
+<ParamField path="--fake" type="flag">
+  Mark migrations as reversed without running. Requires confirmation unless `--yes` is passed.
+</ParamField>
+
+<ParamField path="--dry-run" type="flag">
+  Show which migrations would be reversed without executing.
+</ParamField>
+
+<ParamField path="--yes" type="flag">
+  Skip confirmation prompts.
+</ParamField>
+
+<ParamField path="--log-level" type="choice">
+  Logging level to use.
+</ParamField>
+
+#### Examples
+
+<CodeGroup>
+```bash Clear In-Progress Migrations
+# Reverse all in-progress migrations
+snuba migrations reverse-in-progress
+```
+
+```bash Specific Group
+# Clear in-progress for specific group
+snuba migrations reverse-in-progress --group events
+```
+
+```bash Dry Run
+# Check what would be reversed
+snuba migrations reverse-in-progress --dry-run
+```
+
+```bash Fake Reverse
+# Mark as reversed without running
+snuba migrations reverse-in-progress --fake --yes
+```
+</CodeGroup>
+
+<Note>
+  This command is useful for recovering from failed migrations that left the system in an in-progress state.
+</Note>
+
+### generate
+
+Generates a new migration file based on schema changes in a storage definition.
+
+```bash
+snuba migrations generate STORAGE_PATH [OPTIONS]
+```
+
+<ParamField path="STORAGE_PATH" type="string" required>
+  Path to the modified storage YAML definition file.
+  
+  Must match pattern: `snuba/datasets/configuration/.*/storages/.*.(yml|yaml)`
+</ParamField>
+
+<ParamField path="--name" type="string">
+  Optional name for the generated migration. If not provided, a default name is generated.
+</ParamField>
+
+#### How It Works
+
+1. **Modify Storage YAML** - Edit the storage definition file to add/modify schema
+2. **Leave Uncommitted** - The changes must be uncommitted in your working directory
+3. **Run Generate** - Command analyzes the diff between HEAD and working directory
+4. **Migration Created** - A Python migration file is generated in the appropriate directory
+
+<Note>
+  Currently only **column addition** is supported for automatic generation. Other schema changes require manual migration creation.
+</Note>
+
+#### Examples
+
+<CodeGroup>
+```bash Generate from Storage Changes
+# Generate migration for modified storage
+snuba migrations generate \
+  snuba/datasets/configuration/events/storages/errors.yaml
+```
+
+```bash With Custom Name
+# Generate with specific migration name
+snuba migrations generate \
+  snuba/datasets/configuration/events/storages/errors.yaml \
+  --name add_error_id_column
+```
+
+```bash Typical Workflow
+# 1. Modify storage definition
+vim snuba/datasets/configuration/events/storages/errors.yaml
+
+# 2. Generate migration (don't commit changes yet)
+snuba migrations generate \
+  snuba/datasets/configuration/events/storages/errors.yaml \
+  --name add_new_field
+
+# Output: Migration successfully generated at snuba/migrations/snuba_migrations/events/0042_add_new_field.py
+
+# 3. Review the generated migration
+cat snuba/migrations/snuba_migrations/events/0042_add_new_field.py
+
+# 4. Commit both storage and migration files together
+git add snuba/datasets/configuration/events/storages/errors.yaml
+git add snuba/migrations/snuba_migrations/events/0042_add_new_field.py
+git commit -m "Add new field to errors storage"
+```
+</CodeGroup>
+
+<Warning>
+  The migration is generated based on uncommitted changes. Ensure your storage modifications are correct before generating the migration.
+</Warning>
+
+## Migration Groups and Readiness States
+
+### Common Migration Groups
+
+- **system** - Core system tables for storing migration status
+- **events** - Error and exception events
+- **transactions** - Transaction/span events  
+- **outcomes** - Outcome and billing data
+- **sessions** - Session aggregates
+- **metrics** - Metrics data (various types)
+- **querylog** - Query logs and performance data
+- **profiles** - Profiling data
+- **replays** - Session replay data
+
+### Readiness States
+
+<AccordionGroup>
+  <Accordion title="complete">
+    Fully implemented and production-ready. Safe to run in all environments.
+  </Accordion>
+  
+  <Accordion title="limited">
+    Limited availability or partial rollout. May be enabled only for certain tenants.
+  </Accordion>
+  
+  <Accordion title="experimental">
+    Experimental features under active development. Use with caution.
+  </Accordion>
+  
+  <Accordion title="partial">
+    Partially implemented functionality. May be missing features or optimizations.
+  </Accordion>
+</AccordionGroup>
+
+## Migration Status
+
+Migrations can be in one of three states:
+
+1. **NOT_STARTED** - Migration has not been applied
+2. **IN_PROGRESS** - Migration is currently running (or was interrupted)
+3. **COMPLETED** - Migration was successfully applied
+
+## Best Practices
+
+### Before Running Migrations
+
+<Steps>
+  <Step title="Review Migration Code">
+    Always review the migration code before running, especially for blocking migrations.
+  </Step>
+  
+  <Step title="Use Dry Run">
+    Use `--dry-run` to preview SQL that will be executed.
+    ```bash
+    snuba migrations run --group events --migration-id 0005 --dry-run
+    ```
+  </Step>
+  
+  <Step title="Check for Blocking Operations">
+    Use `--check-dangerous` to identify potentially dangerous operations.
+    ```bash
+    snuba migrations run --group events --migration-id 0005 --check-dangerous
+    ```
+  </Step>
+  
+  <Step title="Backup Data">
+    Ensure you have backups before running destructive migrations.
+  </Step>
+  
+  <Step title="Test in Staging">
+    Always test migrations in a staging environment first.
+  </Step>
+</Steps>
+
+### Running Migrations in Production
+
+<CodeGroup>
+```bash Safe Approach
+# 1. List current status
+snuba migrations list
+
+# 2. Review specific migration
+snuba migrations run \
+  --group events \
+  --migration-id 0005_new_column \
+  --dry-run
+
+# 3. Check for dangerous operations
+snuba migrations run \
+  --group events \
+  --migration-id 0005_new_column \
+  --check-dangerous
+
+# 4. Run with verbose logging
+snuba migrations run \
+  --group events \
+  --migration-id 0005_new_column \
+  --force \
+  --log-level debug
+```
+
+```bash Bulk Migration
+# Run all pending migrations by readiness state
+snuba migrations migrate \
+  --readiness-state complete \
+  --force \
+  --log-level info
+```
+</CodeGroup>
+
+### Handling Failed Migrations
+
+<Accordion title="Migration Stuck in IN_PROGRESS">
+  If a migration is interrupted:
+  
+  ```bash
+  # Option 1: Reverse the in-progress migration
+  snuba migrations reverse-in-progress --group events
+  
+  # Option 2: Fake reverse if safe
+  snuba migrations reverse-in-progress --group events --fake --yes
+  
+  # Then retry the migration
+  snuba migrations run --group events --migration-id 0005 --force
+  ```
+</Accordion>
+
+<Accordion title="Migration Applied Manually">
+  If you manually applied schema changes:
+  
+  ```bash
+  # Mark migration as complete without running
+  snuba migrations run \
+    --group events \
+    --migration-id 0005 \
+    --fake
+  ```
+</Accordion>
+
+<Accordion title="Need to Rollback">
+  To rollback a completed migration:
+  
+  ```bash
+  # Reverse the specific migration
+  snuba migrations reverse \
+    --group events \
+    --migration-id 0005 \
+    --force
+  ```
+</Accordion>
+
+## Connection Requirements
+
+<Note>
+  All migration commands (except `generate` with `--dry-run`) check ClickHouse connections before executing. Ensure ClickHouse clusters are accessible before running migrations.
+</Note>
+
+The system checks connections to:
+- All clusters (for `migrate` and `revert` without specific group)
+- Specific clusters for the migration group (when `--group` is specified)
+- Clusters matching readiness states (when `--readiness-state` is used)
+
+## Monitoring Migrations
+
+### Check Migration Status
+
+```bash
+# List all migrations and their status
+snuba migrations list
+
+# Check specific group
+snuba migrations list | grep "events"
+
+# Check for in-progress migrations
+snuba migrations list | grep "IN PROGRESS"
+```
+
+### Verbose Logging
+
+Use debug logging to monitor migration execution:
+
+```bash
+snuba migrations migrate \
+  --group events \
+  --log-level debug \
+  --force
+```
+
+## Common Workflows
+
+### Initial Setup
+
+```bash
+# Run all system migrations first
+snuba migrations migrate --group system --force
+
+# Then run all other migrations
+snuba migrations migrate --force
+```
+
+### Deploying New Features
+
+```bash
+# Run migrations for specific readiness level
+snuba migrations migrate \
+  --readiness-state limited \
+  --force
+```
+
+### Developing New Migrations
+
+```bash
+# 1. Modify storage YAML
+vim snuba/datasets/configuration/events/storages/errors.yaml
+
+# 2. Generate migration
+snuba migrations generate \
+  snuba/datasets/configuration/events/storages/errors.yaml \
+  --name add_new_column
+
+# 3. Test migration locally
+snuba migrations run \
+  --group events \
+  --migration-id 0XXX_add_new_column \
+  --dry-run
+
+# 4. Apply migration
+snuba migrations run \
+  --group events \
+  --migration-id 0XXX_add_new_column \
+  --force
+```
+
+## See Also
+
+- **MIGRATIONS.md** in the repository root for detailed migration development guide
+- **Migration Runner** source code: `snuba/migrations/runner.py`
+- **Migration Groups** definition: `snuba/migrations/groups.py`

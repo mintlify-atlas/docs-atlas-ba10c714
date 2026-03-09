@@ -1,0 +1,511 @@
+---
+title: SnQL Syntax
+description: Complete reference for the Snuba Query Language (SnQL)
+---
+
+SnQL (Snuba Query Language) is a SQL-like declarative language for querying event data in Snuba. It provides a structured way to query entities with support for joins, subqueries, aggregations, and filtering.
+
+## Query Structure
+
+A SnQL query follows this general structure:
+
+```sql
+MATCH simple | join | subquery
+SELECT [expressions] | [aggregations BY expressions]
+ARRAY JOIN [column]
+WHERE condition [[AND | OR] condition]*
+HAVING condition [[AND | OR] condition]*
+ORDER BY expression ASC|DESC [, expression ASC|DESC]*
+LIMIT n BY [expressions]
+LIMIT n
+OFFSET n
+GRANULARITY n
+TOTALS boolean
+```
+
+## MATCH Clause
+
+The MATCH clause identifies which entity or storage to query. There are three types of MATCH patterns:
+
+### Simple Match
+
+Query a single entity or storage:
+
+```sql
+MATCH (events)
+```
+
+For datasets without entities, query storage directly:
+
+```sql
+MATCH (STORAGE(profile_chunks))
+```
+
+Optionally include sampling:
+
+```sql
+MATCH (events SAMPLE 0.1)  -- Sample 10% of rows
+MATCH (events SAMPLE 1000)  -- Sample 1000 rows
+```
+
+<CodeGroup>
+
+```sql Entity Query
+MATCH (events)
+SELECT count() AS event_count
+WHERE project_id = 1
+  AND timestamp >= toDateTime('2024-01-01')
+  AND timestamp < toDateTime('2024-01-02')
+```
+
+```sql Storage Query
+MATCH (STORAGE(profile_chunks))
+SELECT chunk_id, profile_id
+WHERE project_id = 1
+  AND start_timestamp >= toDateTime('2024-01-01')
+```
+
+</CodeGroup>
+
+### Subquery Match
+
+Query the results of another query:
+
+```sql
+MATCH {
+  MATCH (transactions)
+  SELECT avg(duration) AS avg_d BY transaction
+  WHERE project_id = 1
+    AND timestamp >= toDateTime('2024-01-01')
+    AND timestamp < toDateTime('2024-01-02')
+}
+SELECT max(avg_d) AS max_avg_duration
+```
+
+Subqueries allow you to compute aggregations over already-aggregated data. The outer query can only reference columns and aliases from the inner query's SELECT clause.
+
+<Note>
+  Subqueries are useful for computing percentiles of aggregates, filtering on aggregated values, or performing multi-level rollups.
+</Note>
+
+### Join Match
+
+Query across multiple related entities:
+
+```sql
+MATCH (e: events) -[grouped]-> (gm: groupedmessage)
+SELECT e.event_id, gm.status, count() AS event_count
+BY e.group_id, gm.status
+WHERE e.project_id = 1
+  AND gm.project_id = 1
+  AND e.timestamp >= toDateTime('2024-01-01')
+  AND e.timestamp < toDateTime('2024-01-02')
+```
+
+Multiple joins are supported:
+
+```sql
+MATCH
+  (e: events) -[grouped]-> (g: groupedmessage),
+  (e: events) -[assigned]-> (a: groupassignee)
+SELECT count() AS total BY e.project_id, g.id
+WHERE a.user_id = "user_123"
+  AND e.timestamp >= toDateTime('2024-01-01')
+  AND e.timestamp < toDateTime('2024-01-02')
+```
+
+<Warning>
+  When using joins:
+  - Each entity must have a unique alias
+  - All column references must be qualified with the alias (e.g., `e.event_id`)
+  - Join keys and types are defined in the entity data model and cannot be customized per query
+  - Not all entities can be joined together
+</Warning>
+
+## SELECT Clause
+
+The SELECT clause specifies which columns and computations to return.
+
+### Basic Selection
+
+```sql
+SELECT event_id, project_id, timestamp
+```
+
+### With Aliases
+
+```sql
+SELECT event_id AS id, project_id AS pid
+```
+
+### Functions
+
+```sql
+SELECT 
+  toString(event_id) AS event_id_str,
+  toStartOfHour(timestamp) AS hour
+```
+
+### Aggregations
+
+When using aggregation functions, use the `BY` clause for grouping:
+
+```sql
+SELECT count() AS total, sum(duration) AS total_duration
+BY project_id, transaction
+WHERE timestamp >= toDateTime('2024-01-01')
+  AND timestamp < toDateTime('2024-01-02')
+```
+
+<Note>
+  If using aggregations without a `BY` clause, only aggregation functions are allowed in SELECT. You cannot mix aggregations and non-aggregated columns without grouping.
+</Note>
+
+## WHERE Clause
+
+Filters rows before aggregation. Supports standard comparison operators and boolean logic.
+
+### Operators
+
+<Tabs>
+  <Tab title="Comparison">
+    - `=` Equal
+    - `!=` Not equal
+    - `<` Less than
+    - `<=` Less than or equal
+    - `>` Greater than
+    - `>=` Greater than or equal
+  </Tab>
+  <Tab title="Set Operations">
+    - `IN` Value in list
+    - `NOT IN` Value not in list
+  </Tab>
+  <Tab title="String Matching">
+    - `LIKE` Pattern matching
+    - `NOT LIKE` Negated pattern matching
+  </Tab>
+  <Tab title="Null Checking">
+    - `IS NULL` Value is null
+    - `IS NOT NULL` Value is not null
+  </Tab>
+</Tabs>
+
+### Examples
+
+```sql
+-- Basic conditions
+WHERE project_id = 1
+  AND timestamp >= toDateTime('2024-01-01')
+  AND timestamp < toDateTime('2024-01-02')
+
+-- IN operator
+WHERE project_id IN array(1, 2, 3)
+  AND environment IN array('production', 'staging')
+
+-- LIKE operator
+WHERE transaction LIKE '%/api/%'
+  AND transaction NOT LIKE '%/health%'
+
+-- NULL checks
+WHERE error_message IS NOT NULL
+  AND user_id IS NOT NULL
+
+-- Complex boolean logic
+WHERE (status_code >= 500 OR status_code = 429)
+  AND (environment = 'production' OR environment = 'staging')
+```
+
+<Warning>
+  Most entities require specific conditions:
+  - **project_id**: Usually required
+  - **timestamp range**: Required for time-based entities
+  - Example: `timestamp >= toDateTime('2024-01-01') AND timestamp < toDateTime('2024-01-02')`
+</Warning>
+
+## HAVING Clause
+
+Filters rows after aggregation. Uses the same operators as WHERE but operates on aggregated results:
+
+```sql
+SELECT count() AS error_count, transaction
+BY transaction
+WHERE timestamp >= toDateTime('2024-01-01')
+  AND timestamp < toDateTime('2024-01-02')
+HAVING error_count > 100
+```
+
+## ORDER BY Clause
+
+Sorts results by one or more expressions:
+
+```sql
+-- Single column
+ORDER BY timestamp DESC
+
+-- Multiple columns
+ORDER BY project_id ASC, timestamp DESC
+
+-- By aggregation
+SELECT count() AS total BY transaction
+WHERE timestamp >= toDateTime('2024-01-01')
+ORDER BY total DESC
+```
+
+## LIMIT and OFFSET
+
+Control result set size:
+
+```sql
+LIMIT 100        -- Return up to 100 rows
+LIMIT 100 OFFSET 50  -- Skip 50 rows, then return 100
+```
+
+<Note>
+  Default limit is 1000 rows if not specified. Default offset is 0.
+</Note>
+
+### LIMIT BY
+
+Limit results per group:
+
+```sql
+SELECT event_id, transaction, timestamp
+BY transaction
+WHERE timestamp >= toDateTime('2024-01-01')
+ORDER BY timestamp DESC
+LIMIT 10 BY transaction  -- Return up to 10 events per transaction
+LIMIT 100  -- Total limit across all groups
+```
+
+## GRANULARITY
+
+Groups time-based results into buckets. Used with special time-series columns:
+
+```sql
+MATCH (events)
+SELECT count() AS event_count BY time
+WHERE timestamp >= toDateTime('2024-01-01')
+  AND timestamp < toDateTime('2024-01-02')
+GRANULARITY 3600  -- Group by hour (3600 seconds)
+```
+
+Common granularity values:
+- `60` - 1 minute
+- `300` - 5 minutes
+- `3600` - 1 hour
+- `86400` - 1 day
+
+The magic column name varies by entity. For events, it's `time`. Check entity documentation for the correct column name.
+
+## TOTALS
+
+Includes total aggregations across all rows:
+
+```sql
+SELECT count() AS total, sum(duration) AS total_duration
+BY transaction
+WHERE timestamp >= toDateTime('2024-01-01')
+TOTALS true
+```
+
+When `TOTALS true` is set, the response includes a `totals` object with aggregated values across all rows.
+
+## ARRAY JOIN
+
+Flattens array columns into multiple rows:
+
+```sql
+SELECT exception_frames.filename, exception_frames.lineno
+ARRAY JOIN exception_frames
+WHERE project_id = 1
+  AND timestamp >= toDateTime('2024-01-01')
+```
+
+This is useful for querying nested array data like stack traces, breadcrumbs, or spans.
+
+## Functions
+
+SnQL supports a wide range of functions from ClickHouse.
+
+### Aggregation Functions
+
+<CodeGroup>
+
+```sql Basic Aggregations
+SELECT
+  count() AS total,
+  min(duration) AS min_duration,
+  max(duration) AS max_duration,
+  avg(duration) AS avg_duration,
+  sum(duration) AS total_duration
+BY project_id
+```
+
+```sql Advanced Aggregations
+SELECT
+  uniq(user_id) AS unique_users,
+  quantile(0.95)(duration) AS p95,
+  quantiles(0.5, 0.95, 0.99)(duration) AS quantiles,
+  topK(10)(transaction) AS top_transactions
+BY project_id
+```
+
+</CodeGroup>
+
+### String Functions
+
+```sql
+SELECT
+  toString(event_id) AS event_id_str,
+  length(message) AS message_length,
+  positionCaseInsensitive(message, 'error') AS has_error
+```
+
+### Date/Time Functions
+
+```sql
+SELECT
+  toStartOfHour(timestamp) AS hour,
+  toStartOfDay(timestamp) AS day,
+  toUnixTimestamp(timestamp) AS unix_time
+```
+
+### Conditional Functions
+
+```sql
+SELECT
+  if(status_code >= 500, 'server_error', 'ok') AS status_category,
+  multiIf(
+    status_code < 300, 'success',
+    status_code < 400, 'redirect',
+    status_code < 500, 'client_error',
+    'server_error'
+  ) AS detailed_category
+```
+
+### Array Functions
+
+```sql
+SELECT
+  has(tags.key, 'environment') AS has_env_tag,
+  indexOf(tags.key, 'environment') AS env_tag_index,
+  arrayElement(tags.value, indexOf(tags.key, 'environment')) AS env_value
+```
+
+### Custom Functions
+
+Snuba provides custom functions for specific use cases:
+
+```sql
+-- Apdex score calculation
+SELECT
+  apdex(duration, 300) AS apdex_score
+BY transaction
+```
+
+<Note>
+  For a complete list of supported functions, see the [ClickHouse function documentation](https://clickhouse.tech/docs/en/sql-reference/functions/).
+</Note>
+
+## Complete Examples
+
+### Event Error Rate
+
+```sql
+MATCH (events)
+SELECT
+  count() AS total_events,
+  countIf(level = 'error') AS error_events,
+  error_events / total_events AS error_rate
+BY project_id, environment
+WHERE type != 'transaction'
+  AND project_id IN array(1, 2, 3)
+  AND timestamp >= toDateTime('2024-01-01T00:00:00')
+  AND timestamp < toDateTime('2024-01-02T00:00:00')
+HAVING error_rate > 0.01
+ORDER BY error_rate DESC
+LIMIT 100
+```
+
+### Transaction Performance Over Time
+
+```sql
+MATCH (transactions)
+SELECT
+  quantile(0.95)(duration) AS p95_duration,
+  quantile(0.50)(duration) AS p50_duration,
+  count() AS transaction_count
+BY time, transaction
+WHERE project_id = 1
+  AND timestamp >= toDateTime('2024-01-01T00:00:00')
+  AND timestamp < toDateTime('2024-01-02T00:00:00')
+GRANULARITY 3600
+ORDER BY time ASC
+LIMIT 10000
+```
+
+### Join Query with Multiple Entities
+
+```sql
+MATCH (e: events) -[grouped]-> (gm: groupedmessage)
+SELECT
+  e.group_id,
+  gm.status,
+  count() AS event_count,
+  max(e.timestamp) AS last_seen,
+  uniq(e.user_id) AS affected_users
+BY e.group_id, gm.status
+WHERE e.project_id = 1
+  AND gm.project_id = 1
+  AND e.timestamp >= toDateTime('2024-01-01T00:00:00')
+  AND e.timestamp < toDateTime('2024-01-02T00:00:00')
+  AND gm.status = 0
+HAVING event_count > 10
+ORDER BY event_count DESC
+LIMIT 50
+```
+
+### Subquery for Top Slowest Transactions
+
+```sql
+MATCH {
+  MATCH (transactions)
+  SELECT
+    transaction,
+    avg(duration) AS avg_duration,
+    count() AS count
+  BY transaction
+  WHERE project_id = 1
+    AND timestamp >= toDateTime('2024-01-01T00:00:00')
+    AND timestamp < toDateTime('2024-01-02T00:00:00')
+  HAVING count > 100
+}
+SELECT
+  transaction,
+  avg_duration,
+  count
+WHERE avg_duration > 1000
+ORDER BY avg_duration DESC
+LIMIT 10
+```
+
+## Best Practices
+
+- **Always include required conditions**: Check entity requirements for project_id and timestamp
+- **Use appropriate data types**: Use `toDateTime()` for timestamp comparisons
+- **Leverage indexes**: Conditions on indexed columns (project_id, tags) are faster
+- **Be mindful of cardinality**: Grouping by high-cardinality columns can be expensive
+- **Use sampling for exploration**: Add `SAMPLE` to MATCH for faster exploratory queries
+- **Prefer specific time ranges**: Smaller time ranges are more efficient
+- **Use HAVING for post-aggregation filtering**: Don't put aggregation conditions in WHERE
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="MQL Syntax" icon="chart-line" href="/query/mql">
+    Learn MQL for metrics queries
+  </Card>
+  <Card title="Query Optimization" icon="gauge-high" href="/query/optimization">
+    Optimize your SnQL queries
+  </Card>
+</CardGroup>

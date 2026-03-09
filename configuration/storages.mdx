@@ -1,0 +1,682 @@
+---
+title: Storage Configuration
+description: Configure Snuba storage backends for ClickHouse tables with readable and writable storage types
+---
+
+Storage configurations define physical data storage in ClickHouse. Snuba supports readable storages (read-only views) and writable storages (tables with stream consumers).
+
+## Overview
+
+Storage configurations specify:
+
+- **Schema**: Column definitions and table names
+- **Storage keys**: Unique identifiers and cluster assignments
+- **Readiness state**: Deployment environment availability
+- **Query processors**: Storage-level query optimizations
+- **Allocation policies**: Resource limits and rate limiting
+- **Stream loader** (writable only): Kafka consumer configuration
+- **Deletion settings**: Configuration for data deletion operations
+
+## Storage Types
+
+<CardGroup cols={2}>
+  <Card title="Readable Storage" icon="book-open">
+    Read-only storage backed by ClickHouse tables or views. Used for immutable or replicated data.
+  </Card>
+  <Card title="Writable Storage" icon="pen-to-square">
+    Read-write storage with Kafka stream consumers. Supports real-time data ingestion and updates.
+  </Card>
+</CardGroup>
+
+## Readable Storage Schema
+
+<ParamField path="version" type="string" required>
+  Schema version. Must be `v1`.
+</ParamField>
+
+<ParamField path="kind" type="string" required>
+  Component type. Must be `readable_storage`.
+</ParamField>
+
+<ParamField path="name" type="string" required>
+  Unique name for the storage.
+</ParamField>
+
+<ParamField path="storage" type="object" required>
+  Storage identification:
+  - `key`: Unique storage identifier
+  - `set_key`: Storage set/cluster identifier
+</ParamField>
+
+<ParamField path="readiness_state" type="string" required>
+  Deployment readiness: `limited`, `partial`, `complete`, `experimental`, or `deprecate`.
+</ParamField>
+
+<ParamField path="schema" type="object" required>
+  Table schema definition:
+  - `columns`: Array of column definitions
+  - `local_table_name`: Local table name in ClickHouse
+  - `dist_table_name`: Distributed table name
+  - `partition_format`: Optional partition format
+  - `not_deleted_mandatory_condition`: Column for soft deletion
+</ParamField>
+
+<ParamField path="query_processors" type="array">
+  Array of query processor configurations for storage-level optimizations.
+</ParamField>
+
+<ParamField path="allocation_policies" type="array">
+  Resource allocation and rate limiting policies.
+</ParamField>
+
+<ParamField path="mandatory_condition_checkers" type="array">
+  Security checks to enforce required query conditions.
+</ParamField>
+
+<ParamField path="deletion_settings" type="object">
+  Configuration for deletion operations.
+</ParamField>
+
+<ParamField path="required_time_column" type="string">
+  Name of the required time column for time-based queries.
+</ParamField>
+
+## Writable Storage Schema
+
+Writable storage includes all readable storage fields plus:
+
+<ParamField path="kind" type="string" required>
+  Must be `writable_storage`.
+</ParamField>
+
+<ParamField path="stream_loader" type="object" required>
+  Kafka consumer configuration:
+  - `processor`: Message processor class name
+  - `default_topic`: Primary Kafka topic
+  - `commit_log_topic`: Commit log topic
+  - `subscription_scheduled_topic`: Subscription scheduling topic
+  - `subscription_result_topic`: Subscription results topic
+  - `subscription_scheduler_mode`: Scheduler mode (partition/global)
+  - `replacement_topic`: Replacements/deletions topic
+  - `dlq_topic`: Dead letter queue topic
+  - `pre_filter`: Optional message filter
+</ParamField>
+
+<ParamField path="replacer_processor" type="object">
+  Configuration for handling replacements (updates/deletions).
+</ParamField>
+
+<ParamField path="writer_options" type="object">
+  ClickHouse writer-specific options.
+</ParamField>
+
+## Readable Storage Example
+
+```yaml errors_ro.yaml
+version: v1
+kind: readable_storage
+name: errors_ro
+
+storage:
+  key: errors_ro
+  set_key: events_ro
+
+readiness_state: complete
+
+schema:
+  columns:
+    - name: project_id
+      type: UInt
+      args:
+        size: 64
+    - name: timestamp
+      type: DateTime
+    - name: event_id
+      type: UUID
+    - name: message
+      type: String
+    - name: environment
+      type: String
+      args:
+        schema_modifiers: [nullable]
+    - name: tags
+      type: Nested
+      args:
+        subcolumns:
+          - name: key
+            type: String
+          - name: value
+            type: String
+    - name: deleted
+      type: UInt
+      args:
+        size: 8
+        
+  local_table_name: errors_local
+  dist_table_name: errors_dist_ro
+  not_deleted_mandatory_condition: deleted
+
+allocation_policies:
+  - name: ReferrerGuardRailPolicy
+    args:
+      required_tenant_types:
+        - referrer
+      default_config_overrides:
+        is_enforced: 1
+        
+  - name: ConcurrentRateLimitAllocationPolicy
+    args:
+      required_tenant_types:
+        - organization_id
+        - referrer
+        - project_id
+
+query_processors:
+  - processor: UUIDColumnProcessor
+    args:
+      columns: [event_id, trace_id]
+      
+  - processor: PrewhereProcessor
+    args:
+      prewhere_candidates:
+        - event_id
+        - project_id
+        - timestamp
+
+mandatory_condition_checkers:
+  - condition: ProjectIdEnforcer
+```
+
+## Writable Storage Example
+
+```yaml errors.yaml
+version: v1
+kind: writable_storage
+name: errors
+
+storage:
+  key: errors
+  set_key: events
+
+readiness_state: complete
+
+schema:
+  columns:
+    - name: project_id
+      type: UInt
+      args:
+        size: 64
+    - name: timestamp
+      type: DateTime
+    - name: event_id
+      type: UUID
+    - name: message
+      type: String
+    - name: deleted
+      type: UInt
+      args:
+        size: 8
+        
+  local_table_name: errors_local
+  dist_table_name: errors_dist
+  
+  partition_format:
+    - retention_days
+    - date
+    
+  not_deleted_mandatory_condition: deleted
+
+stream_loader:
+  processor: ErrorsProcessor
+  default_topic: events
+  commit_log_topic: snuba-commit-log
+  replacement_topic: event-replacements
+  subscription_scheduler_mode: partition
+  subscription_scheduled_topic: scheduled-subscriptions-events
+  subscription_result_topic: events-subscription-results
+  subscription_synchronization_timestamp: received_p99
+  subscription_delay_seconds: 30
+
+query_processors:
+  - processor: UniqInSelectAndHavingProcessor
+  
+  - processor: MappingColumnPromoter
+    args:
+      mapping_specs:
+        tags:
+          environment: environment
+          sentry:release: release
+          
+  - processor: UUIDColumnProcessor
+    args:
+      columns: [event_id, primary_hash, trace_id]
+      
+  - processor: MappingOptimizer
+    args:
+      column_name: tags
+      hash_map_name: _tags_hash_map
+      killswitch: events_tags_hash_map_enabled
+      
+  - processor: PrewhereProcessor
+    args:
+      omit_if_final:
+        - environment
+        - release
+      prewhere_candidates:
+        - event_id
+        - project_id
+        - timestamp
+
+allocation_policies:
+  - name: ReferrerGuardRailPolicy
+    args:
+      required_tenant_types:
+        - referrer
+      default_config_overrides:
+        is_enforced: 1
+        
+  - name: BytesScannedRejectingPolicy
+    args:
+      required_tenant_types:
+        - organization_id
+        - project_id
+        - referrer
+      default_config_overrides:
+        is_enforced: 1
+
+mandatory_condition_checkers:
+  - condition: ProjectIdEnforcer
+
+replacer_processor:
+  processor: ErrorsReplacer
+  args:
+    required_columns:
+      - event_id
+      - project_id
+      - group_id
+      - timestamp
+    state_name: errors
+    storage_key_str: errors
+```
+
+## Schema Configuration
+
+### Column Definitions
+
+Columns must specify name, type, and optional arguments:
+
+<CodeGroup>
+```yaml Basic Types
+columns:
+  - name: project_id
+    type: UInt
+    args:
+      size: 64
+      
+  - name: timestamp
+    type: DateTime
+    
+  - name: event_id
+    type: UUID
+```
+
+```yaml Nullable Columns
+columns:
+  - name: environment
+    type: String
+    args:
+      schema_modifiers: [nullable]
+      
+  - name: trace_id
+    type: UUID
+    args:
+      schema_modifiers: [nullable]
+```
+
+```yaml Complex Types
+columns:
+  - name: tags
+    type: Nested
+    args:
+      subcolumns:
+        - name: key
+          type: String
+        - name: value
+          type: String
+          
+  - name: sdk_integrations
+    type: Array
+    args:
+      inner_type:
+        type: String
+```
+</CodeGroup>
+
+### Table Names
+
+<ParamField path="local_table_name" type="string" required>
+  Name of the local table on each ClickHouse node. For single-node deployments, this is the only table.
+</ParamField>
+
+<ParamField path="dist_table_name" type="string" required>
+  Name of the distributed table that queries should use. In distributed ClickHouse, this table routes queries to local tables.
+</ParamField>
+
+### Partition Format
+
+Define how data is partitioned:
+
+```yaml Partition Configuration
+schema:
+  partition_format:
+    - retention_days  # Partition by retention policy
+    - date            # Partition by date
+```
+
+### Soft Deletion
+
+Configure soft deletion with a flag column:
+
+```yaml Soft Deletion
+schema:
+  columns:
+    - name: deleted
+      type: UInt
+      args:
+        size: 8
+        
+  not_deleted_mandatory_condition: deleted
+```
+
+This ensures all queries automatically filter out deleted rows.
+
+## Readiness States
+
+Control where storages are available:
+
+<AccordionGroup>
+  <Accordion title="limited">
+    Only available in CI and local development. Use for new storages under development.
+  </Accordion>
+
+  <Accordion title="partial">
+    Available in staging environments. Use for testing before production.
+  </Accordion>
+
+  <Accordion title="complete">
+    Fully available in all environments including production.
+  </Accordion>
+
+  <Accordion title="experimental">
+    Available but marked as experimental. May have stability issues.
+  </Accordion>
+
+  <Accordion title="deprecate">
+    Marked for deprecation. Will be removed in a future release.
+  </Accordion>
+</AccordionGroup>
+
+```yaml Readiness State
+readiness_state: complete  # Production-ready
+```
+
+## Stream Loader Configuration
+
+For writable storages, configure Kafka consumers:
+
+```yaml Stream Loader
+stream_loader:
+  processor: ErrorsProcessor
+  default_topic: events
+  commit_log_topic: snuba-commit-log
+  replacement_topic: event-replacements
+  
+  # Subscription configuration
+  subscription_scheduler_mode: partition
+  subscription_scheduled_topic: scheduled-subscriptions-events
+  subscription_result_topic: events-subscription-results
+  subscription_synchronization_timestamp: received_p99
+  subscription_delay_seconds: 30
+  
+  # Dead letter queue
+  dlq_topic: snuba-dead-letter-queue
+  
+  # Pre-filtering
+  pre_filter:
+    type: KafkaHeaderSelectFilter
+    args:
+      header_key: event_type
+      header_value: error
+```
+
+### Processor Types
+
+Common message processors:
+
+- `ErrorsProcessor` - Processes error events
+- `TransactionsProcessor` - Processes transaction events
+- `OutcomesProcessor` - Processes outcomes data
+- `MetricsProcessor` - Processes metrics data
+
+### Subscription Scheduler Modes
+
+- `partition` - Schedule per Kafka partition
+- `global` - Global scheduling across all partitions
+
+### Synchronization Timestamps
+
+- `orig_message_ts` - Use original message timestamp
+- `received_p99` - Use 99th percentile of received time
+
+## Query Processors
+
+Storage-level query processors optimize queries:
+
+<CodeGroup>
+```yaml UUID Processing
+query_processors:
+  - processor: UUIDColumnProcessor
+    args:
+      columns:
+        - event_id
+        - trace_id
+        - replay_id
+```
+
+```yaml Mapping Optimization
+query_processors:
+  - processor: MappingOptimizer
+    args:
+      column_name: tags
+      hash_map_name: _tags_hash_map
+      killswitch: events_tags_hash_map_enabled
+```
+
+```yaml PREWHERE Optimization
+query_processors:
+  - processor: PrewhereProcessor
+    args:
+      omit_if_final:
+        - environment
+        - release
+      prewhere_candidates:
+        - event_id
+        - trace_id
+        - project_id
+        - timestamp
+```
+</CodeGroup>
+
+### Common Query Processors
+
+<AccordionGroup>
+  <Accordion title="UniqInSelectAndHavingProcessor">
+    Optimizes `uniq()` functions in SELECT and HAVING clauses.
+  </Accordion>
+
+  <Accordion title="MappingColumnPromoter">
+    Promotes frequently-used mapping columns to first-class columns.
+  </Accordion>
+
+  <Accordion title="UUIDColumnProcessor">
+    Optimizes UUID column queries.
+  </Accordion>
+
+  <Accordion title="PrewhereProcessor">
+    Implements ClickHouse PREWHERE optimization for faster queries.
+  </Accordion>
+
+  <Accordion title="MappingOptimizer">
+    Optimizes queries on nested/mapping columns using hash maps.
+  </Accordion>
+</AccordionGroup>
+
+## Allocation Policies
+
+Control resource allocation and rate limiting:
+
+```yaml Allocation Policies
+allocation_policies:
+  - name: ReferrerGuardRailPolicy
+    args:
+      required_tenant_types:
+        - referrer
+      default_config_overrides:
+        is_enforced: 1
+        
+  - name: ConcurrentRateLimitAllocationPolicy
+    args:
+      required_tenant_types:
+        - organization_id
+        - referrer
+        - project_id
+        
+  - name: BytesScannedRejectingPolicy
+    args:
+      required_tenant_types:
+        - organization_id
+        - project_id
+        - referrer
+      default_config_overrides:
+        is_enforced: 1
+        
+  - name: BytesScannedWindowAllocationPolicy
+    args:
+      required_tenant_types:
+        - organization_id
+        - referrer
+      default_config_overrides:
+        throttled_thread_number: 1
+        org_limit_bytes_scanned: 10000000
+```
+
+### Policy Types
+
+<AccordionGroup>
+  <Accordion title="ReferrerGuardRailPolicy">
+    Enforces that queries include a referrer for tracking and debugging.
+  </Accordion>
+
+  <Accordion title="ConcurrentRateLimitAllocationPolicy">
+    Limits concurrent queries per tenant (organization, project, referrer).
+  </Accordion>
+
+  <Accordion title="BytesScannedRejectingPolicy">
+    Rejects queries that would scan too many bytes.
+  </Accordion>
+
+  <Accordion title="BytesScannedWindowAllocationPolicy">
+    Throttles queries based on bytes scanned within a time window.
+  </Accordion>
+
+  <Accordion title="CrossOrgQueryAllocationPolicy">
+    Special limits for cross-organization queries.
+  </Accordion>
+</AccordionGroup>
+
+## Mandatory Condition Checkers
+
+Enforce security requirements:
+
+```yaml Mandatory Conditions
+mandatory_condition_checkers:
+  - condition: ProjectIdEnforcer
+  - condition: OrgIdEnforcer
+```
+
+These ensure queries always filter by required columns like `project_id` to prevent data leakage.
+
+## Deletion Settings
+
+Configure deletion operations:
+
+```yaml Deletion Configuration
+deletion_settings:
+  is_enabled: 1
+  tables:
+    - errors_local
+  allowed_columns:
+    - project_id
+    - event_id
+    - timestamp
+  max_rows_to_delete: 10000
+  bulk_delete_only: false
+  partition_column: timestamp
+```
+
+## Replacer Processor
+
+Handle updates and deletions:
+
+```yaml Replacer Configuration
+replacer_processor:
+  processor: ErrorsReplacer
+  args:
+    required_columns:
+      - event_id
+      - primary_hash
+      - project_id
+      - group_id
+      - timestamp
+      - deleted
+    tag_column_map:
+      tags:
+        environment: environment
+        sentry:release: release
+    state_name: errors
+    storage_key_str: errors
+```
+
+## Best Practices
+
+<CardGroup cols={2}>
+  <Card title="Security First" icon="shield-halved">
+    Always configure mandatory condition checkers to enforce multi-tenancy.
+  </Card>
+  
+  <Card title="Resource Limits" icon="gauge-high">
+    Set up allocation policies to prevent resource exhaustion.
+  </Card>
+  
+  <Card title="Optimize Queries" icon="bolt">
+    Use PREWHERE and mapping optimizers for better performance.
+  </Card>
+  
+  <Card title="Partition Wisely" icon="table-cells">
+    Choose partition formats that align with query patterns.
+  </Card>
+</CardGroup>
+
+## Related Configuration
+
+<CardGroup cols={3}>
+  <Card title="Entities" icon="cube" href="/configuration/entities">
+    Connect storages to entities
+  </Card>
+  <Card title="Datasets" icon="database" href="/configuration/datasets">
+    Organize entities in datasets
+  </Card>
+  <Card title="Overview" icon="book" href="/configuration/overview">
+    Configuration system overview
+  </Card>
+</CardGroup>
