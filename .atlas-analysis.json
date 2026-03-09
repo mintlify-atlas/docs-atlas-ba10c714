@@ -1,0 +1,146 @@
+{
+  "projectType": "data-platform",
+  "projectName": "Snuba",
+  "projectDescription": "A time-series data platform built on ClickHouse with fast ingestion, query optimization, and a rich data model for powering Sentry analytics.",
+  "theme": "aspen",
+  "primaryColor": "#5B4FE5",
+  "lightColor": "#7D72FF",
+  "darkColor": "#3E35B5",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "installation"
+            ]
+          },
+          {
+            "group": "Architecture",
+            "pages": [
+              "architecture/overview",
+              "architecture/data-model",
+              "architecture/storage",
+              "architecture/ingestion",
+              "architecture/query-processing",
+              "architecture/slicing"
+            ]
+          },
+          {
+            "group": "Query Languages",
+            "pages": [
+              "query/overview",
+              "query/snql",
+              "query/mql",
+              "query/optimization"
+            ]
+          },
+          {
+            "group": "Datasets",
+            "pages": [
+              "datasets/overview",
+              "datasets/events",
+              "datasets/transactions",
+              "datasets/metrics",
+              "datasets/sessions",
+              "datasets/replays"
+            ]
+          },
+          {
+            "group": "Configuration",
+            "pages": [
+              "configuration/overview",
+              "configuration/datasets",
+              "configuration/entities",
+              "configuration/storages",
+              "configuration/subscriptions"
+            ]
+          },
+          {
+            "group": "Migrations",
+            "pages": [
+              "migrations/overview",
+              "migrations/modes",
+              "migrations/creating-migrations",
+              "migrations/distributed"
+            ]
+          },
+          {
+            "group": "Operations",
+            "pages": [
+              "operations/deployment",
+              "operations/monitoring",
+              "operations/scaling",
+              "operations/clickhouse-topology"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "CLI Reference",
+        "groups": [
+          {
+            "group": "Commands",
+            "pages": [
+              "cli/overview",
+              "cli/consumer",
+              "cli/migrations",
+              "cli/devserver",
+              "cli/admin"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Endpoints",
+            "pages": [
+              "api/overview",
+              "api/query",
+              "api/subscriptions"
+            ]
+          },
+          {
+            "group": "Python API",
+            "pages": [
+              "api/python/datasets",
+              "api/python/query-builder",
+              "api/python/processors"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "ClickHouse-backed time-series data platform",
+    "SnQL and MQL query languages with graph logical data model",
+    "Multi-dataset support for independent data partitions",
+    "Rule-based query optimizer for efficient ClickHouse queries",
+    "Direct Kafka ingestion with consumer framework",
+    "Migration system for DDL changes in single-node and distributed environments",
+    "Point-in-time and streaming queries (subscriptions)",
+    "Admin web interface for managing queries, migrations, and system state"
+  ],
+  "publicApiSurface": [
+    "POST /:dataset/snql - Execute SnQL query",
+    "POST /:dataset/mql - Execute MQL query",
+    "POST /subscriptions - Create streaming subscription",
+    "snuba consumer - Run Kafka consumer",
+    "snuba migrations - Manage database migrations",
+    "snuba devserver - Run development server",
+    "snuba admin - Run admin interface",
+    "snuba api - Run API server",
+    "Dataset - Core dataset abstraction",
+    "Entity - Query-level data model",
+    "Storage - Physical storage mapping",
+    "Query - Query execution pipeline",
+    "Consumer - Kafka message processing"
+  ]
+}
