@@ -58,7 +58,6 @@
               "datasets/events",
               "datasets/transactions",
               "datasets/metrics",
-              "datasets/sessions",
               "datasets/replays"
             ]
           },
